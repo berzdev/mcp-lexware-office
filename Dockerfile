@@ -11,6 +11,6 @@ COPY --from=builder /src/package.json .
 COPY --from=builder /src/package-lock.json .
 ENV NODE_ENV=production
 RUN npm ci --ignore-scripts --omit-dev && \
-    npm install -g @modelcontextprotocol/supergateway
+    npm install -g supergateway
 EXPOSE 8000
 CMD ["supergateway", "--stdio", "node /app/build/index.js", "--port", "8000", "--sse", "/sse"]
