@@ -13,4 +13,4 @@ ENV NODE_ENV=production
 RUN npm ci --ignore-scripts --omit-dev && \
     npm install -g supergateway
 EXPOSE 8000
-CMD ["supergateway", "--port", "8000", "--stdio", "node /app/build/index.js"]
+CMD ["supergateway", "--port", "8000", "--stdio", "node /app/build/index.js", "--outputTransport", "streamableHttp"]
