@@ -1,0 +1,24 @@
+# Build + Push des mcp-lexware-office Images auf Docker Hub
+# Quelle: https://github.com/JannikWempe/mcp-lexware-office
+# Trigger: Push auf master oder manuell in Woodpecker
+when:
+  - event: push
+    branch: master
+    path:
+      exclude:
+        - README.md
+
+steps:
+  - name: docker-publish-mcp-lexware-office
+    image: woodpeckerci/plugin-docker-buildx
+    pull: true
+    settings:
+      repo: berzdev/mcp-lexware-office
+      context: .
+      dockerfile: Dockerfile
+      platforms: linux/amd64
+      tags:
+        - latest
+      username: berzdev
+      password:
+        from_secret: dockerhub_token
