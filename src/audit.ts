@@ -1,7 +1,7 @@
 import { appendFileSync } from 'fs';
 import { governance } from './governance.js';
 
-type AuditAction = 'ALLOW' | 'DENY';
+type AuditAction = 'ALLOW' | 'STARTUP';
 
 interface AuditEntry {
 	action: AuditAction;
@@ -17,21 +17,28 @@ function formatEntry(entry: AuditEntry): string {
 	return `${timestamp} | ${entry.action} | ${entry.tool} | ${detailStr}\n`;
 }
 
-export function auditLog(action: AuditAction, tool: string, details: Record<string, string>): void {
+function write(entry: AuditEntry): void {
 	if (!governance.auditLogPath) return;
-
-	const line = formatEntry({ action, tool, details });
 	try {
-		appendFileSync(governance.auditLogPath, line, 'utf8');
+		appendFileSync(governance.auditLogPath, formatEntry(entry), 'utf8');
 	} catch {
 		// Audit log write failures are silent — don't break the tool
 	}
 }
 
 export function auditAllow(tool: string, details: Record<string, string> = {}): void {
-	auditLog('ALLOW', tool, { ...details, user: 'mcp-claude' });
+	write({ action: 'ALLOW', tool, details: { ...details, user: 'mcp-claude' } });
 }
 
-export function auditDeny(tool: string, details: Record<string, string> = {}): void {
-	auditLog('DENY', tool, { ...details, user: 'mcp-claude', reason: 'permission denied' });
+// Fix #6: Governance denials are structural (tools never registered), so we log
+// which tools were suppressed at startup rather than at call time.
+export function auditStartup(suppressedTools: string[], safetyMode: string): void {
+	write({
+		action: 'STARTUP',
+		tool: 'server',
+		details: {
+			safetyMode,
+			suppressed: suppressedTools.length > 0 ? suppressedTools.join(',') : 'none',
+		},
+	});
 }

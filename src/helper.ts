@@ -9,7 +9,12 @@ if (!LEXWARE_OFFICE_API_KEY) {
 const LEXOFFICE_API_BASE = 'https://api.lexoffice.io';
 const USER_AGENT = 'mcp-lexware-office/2.0.0';
 
-export async function makeLexwareOfficeRequest<T>(path: string): Promise<T | null> {
+export type WriteResult<T> =
+	| { ok: true; data: T }
+	| { ok: false; status: number; error: unknown };
+
+// Fix #4: return WriteResult instead of T|null so callers get actionable status codes
+export async function makeLexwareOfficeRequest<T>(path: string): Promise<WriteResult<T>> {
 	const url = `${LEXOFFICE_API_BASE}${path}`;
 	const headers = {
 		'User-Agent': USER_AGENT,
@@ -21,15 +26,19 @@ export async function makeLexwareOfficeRequest<T>(path: string): Promise<T | nul
 
 	try {
 		const response = await fetch(url, { headers });
+		let responseBody: unknown;
+		try { responseBody = await response.json(); } catch { responseBody = null; }
+
 		if (!response.ok) {
-			throw new Error(`HTTP error! status: ${response.status}`);
+			logger.error('Lexware Office request failed', { status: response.status, url });
+			return { ok: false, status: response.status, error: responseBody };
 		}
-		const json = await response.json();
-		logger.log('Lexware Office response', { json });
-		return json as T;
+
+		logger.log('Lexware Office response', { status: response.status });
+		return { ok: true, data: responseBody as T };
 	} catch (error) {
 		logger.error('Error making Lexware Office request', { error });
-		return null;
+		return { ok: false, status: 0, error: 'Network or server error' };
 	}
 }
 
@@ -49,7 +58,8 @@ export async function makeLexwareOfficeFileRequest(
 	try {
 		const response = await fetch(url, { headers });
 		if (!response.ok) {
-			throw new Error(`HTTP error! status: ${response.status}`);
+			logger.error('Lexware Office file request failed', { status: response.status, url });
+			return null;
 		}
 		const contentType = response.headers.get('Content-Type') ?? accept;
 		const mimeType = contentType.split(';')[0].trim();
@@ -63,21 +73,18 @@ export async function makeLexwareOfficeFileRequest(
 	}
 }
 
-export type WriteResult<T> =
-	| { ok: true; data: T }
-	| { ok: false; status: number; error: unknown };
-
 export async function makeLexwareOfficeWriteRequest<T>(
 	path: string,
 	method: 'POST' | 'PUT' | 'PATCH' | 'DELETE',
 	body?: unknown,
 ): Promise<WriteResult<T> | null> {
 	const url = `${LEXOFFICE_API_BASE}${path}`;
-	const headers = {
+	// Fix #8: only set Content-Type when a body is actually sent
+	const headers: Record<string, string> = {
 		'User-Agent': USER_AGENT,
-		'Content-Type': 'application/json',
 		Accept: 'application/json',
 		Authorization: `Bearer ${LEXWARE_OFFICE_API_KEY}`,
+		...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
 	};
 
 	logger.log('Making Lexware Office write request', { url, method });
@@ -90,17 +97,10 @@ export async function makeLexwareOfficeWriteRequest<T>(
 		});
 
 		let responseBody: unknown;
-		try {
-			responseBody = await response.json();
-		} catch {
-			responseBody = null;
-		}
+		try { responseBody = await response.json(); } catch { responseBody = null; }
 
 		if (!response.ok) {
-			logger.error('Lexware Office write request failed', {
-				status: response.status,
-				error: responseBody,
-			});
+			logger.error('Lexware Office write request failed', { status: response.status, error: responseBody });
 			return { ok: false, status: response.status, error: responseBody };
 		}
 
@@ -129,11 +129,7 @@ export async function makeLexwareOfficeMultipartRequest<T>(
 		const response = await fetch(url, { method: 'POST', headers, body: formData });
 
 		let responseBody: unknown;
-		try {
-			responseBody = await response.json();
-		} catch {
-			responseBody = null;
-		}
+		try { responseBody = await response.json(); } catch { responseBody = null; }
 
 		if (!response.ok) {
 			logger.error('Lexware Office multipart request failed', { status: response.status, error: responseBody });
