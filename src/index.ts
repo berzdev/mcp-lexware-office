@@ -180,6 +180,12 @@ const invoiceSchema = {
 		'Service or delivery date — required by the Lexoffice API on all document types',
 	),
 	paymentConditions: paymentConditionsSchema,
+	title: z
+		.string()
+		.optional()
+		.describe(
+			'Custom document title/subject line printed on the PDF, e.g. "Rechnung für Projekt Alpha" or "Abschlussrechnung Q1 2026". If omitted, Lexware uses the default title ("Rechnung", "Angebot", etc.).',
+		),
 	introduction: z
 		.string()
 		.optional()
@@ -188,6 +194,11 @@ const invoiceSchema = {
 		.string()
 		.optional()
 		.describe('Text block printed after the line items (e.g. bank details note, thank-you text). Use \\n for line breaks.'),
+	printLayoutId: z
+		.string()
+		.uuid()
+		.optional()
+		.describe('UUID of the print layout to use. Retrieve available layouts with list-print-layouts. If omitted, the account default layout is used.'),
 };
 
 // Schema for update tools: requires id + version (optimistic locking)
@@ -1876,6 +1887,10 @@ const deliveryNoteBaseSchema = {
 				.describe(SHIPPING_TYPE_HINT),
 		})
 		.describe('Required by Lexoffice API'),
+	title: z
+		.string()
+		.optional()
+		.describe('Custom document title printed on the PDF, e.g. "Lieferschein Auftrag #42". Overrides the default title.'),
 	introduction: z
 		.string()
 		.optional()
@@ -1884,6 +1899,11 @@ const deliveryNoteBaseSchema = {
 		.string()
 		.optional()
 		.describe('Text printed after line items. Use \\n for line breaks.'),
+	printLayoutId: z
+		.string()
+		.uuid()
+		.optional()
+		.describe('UUID of the print layout. Retrieve available layouts with list-print-layouts.'),
 };
 
 server.tool(
@@ -1976,6 +1996,10 @@ const dunningSchema = {
 				.describe(SHIPPING_TYPE_HINT),
 		})
 		.describe('Required by Lexoffice API'),
+	title: z
+		.string()
+		.optional()
+		.describe('Custom document title printed on the PDF. Overrides the default title ("Mahnung").'),
 	introduction: z
 		.string()
 		.optional()
@@ -1984,6 +2008,11 @@ const dunningSchema = {
 		.string()
 		.optional()
 		.describe('Text printed after line items. Use \\n for line breaks.'),
+	printLayoutId: z
+		.string()
+		.uuid()
+		.optional()
+		.describe('UUID of the print layout. Retrieve available layouts with list-print-layouts.'),
 };
 
 server.tool(
