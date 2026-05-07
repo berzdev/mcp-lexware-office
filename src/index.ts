@@ -624,17 +624,40 @@ server.tool(
 	},
 );
 
+const unitPriceSchema = z.object({
+	currency: z.literal('EUR'),
+	netAmount: z.string().describe('Net amount as string, e.g. "9.99"'),
+	taxRatePercentage: z.number().describe('Tax rate, e.g. 19 for 19%'),
+});
+
 const lineItemSchema = z.discriminatedUnion('type', [
 	z.object({
-		type: z.enum(['material', 'service', 'custom']),
-		name: z.string().describe('Line item description'),
+		type: z.literal('material'),
+		id: z.string().uuid().describe('Article ID from Lexware article catalog — required for material type; use get-articles to look up IDs'),
+		name: z.string().describe('Line item name (can override the article name on the document)'),
+		description: z.string().optional().describe('Additional description text shown below the item name on the document'),
 		quantity: z.number().describe('Quantity'),
 		unitName: z.string().describe('Unit name, e.g. "Stunden", "Stück"'),
-		unitPrice: z.object({
-			currency: z.literal('EUR'),
-			netAmount: z.string().describe('Net amount as string, e.g. "9.99"'),
-			taxRatePercentage: z.number().describe('Tax rate, e.g. 19 for 19%'),
-		}),
+		unitPrice: unitPriceSchema,
+		discountPercentage: z.number().min(0).max(100).optional(),
+	}),
+	z.object({
+		type: z.literal('service'),
+		id: z.string().uuid().describe('Service/article ID from Lexware article catalog — required for service type; use get-articles to look up IDs'),
+		name: z.string().describe('Line item name (can override the article name on the document)'),
+		description: z.string().optional().describe('Additional description text shown below the item name on the document'),
+		quantity: z.number().describe('Quantity'),
+		unitName: z.string().describe('Unit name, e.g. "Stunden", "Stück"'),
+		unitPrice: unitPriceSchema,
+		discountPercentage: z.number().min(0).max(100).optional(),
+	}),
+	z.object({
+		type: z.literal('custom'),
+		name: z.string().describe('Line item name/title'),
+		description: z.string().optional().describe('Additional description text shown below the item name on the document'),
+		quantity: z.number().describe('Quantity'),
+		unitName: z.string().describe('Unit name, e.g. "Stunden", "Stück"'),
+		unitPrice: unitPriceSchema,
 		discountPercentage: z.number().min(0).max(100).optional(),
 	}),
 	z.object({
@@ -672,8 +695,8 @@ const invoiceSchema = {
 	}).describe('Service/delivery conditions — required by Lexoffice API'),
 	paymentConditions: z
 		.object({
-			paymentTermLabel: z.string().optional().describe('Payment term label text shown on the document, e.g. "Zahlungsbedingung: 7 Tage, bis zum 08.04.2026"'),
-			paymentTermLabelLanguage: z.enum(['de', 'en']).optional(),
+			paymentTermLabel: z.string().min(1).optional().describe('Custom payment term label shown on the document. When provided, paymentTermLabelLanguage is also required. Omit to let Lexoffice generate the default label from paymentTermDuration.'),
+			paymentTermLabelLanguage: z.enum(['de', 'en']).optional().describe('Language for the paymentTermLabel — required when paymentTermLabel is set'),
 			paymentTermDuration: z.number().int().describe('Payment term in days'),
 			paymentDiscountConditions: z
 				.object({
@@ -1376,8 +1399,25 @@ server.tool(
 
 const deliveryNoteLineItemSchema = z.discriminatedUnion('type', [
 	z.object({
-		type: z.enum(['material', 'service', 'custom']),
-		name: z.string().describe('Line item description'),
+		type: z.literal('material'),
+		id: z.string().uuid().describe('Article ID from Lexware article catalog — required for material type'),
+		name: z.string().describe('Line item name'),
+		description: z.string().optional().describe('Additional description text shown below the item name'),
+		quantity: z.number().describe('Quantity'),
+		unitName: z.string().describe('Unit name, e.g. "Stück", "kg"'),
+	}),
+	z.object({
+		type: z.literal('service'),
+		id: z.string().uuid().describe('Service/article ID from Lexware article catalog — required for service type'),
+		name: z.string().describe('Line item name'),
+		description: z.string().optional().describe('Additional description text shown below the item name'),
+		quantity: z.number().describe('Quantity'),
+		unitName: z.string().describe('Unit name, e.g. "Stück", "kg"'),
+	}),
+	z.object({
+		type: z.literal('custom'),
+		name: z.string().describe('Line item name'),
+		description: z.string().optional().describe('Additional description text shown below the item name'),
 		quantity: z.number().describe('Quantity'),
 		unitName: z.string().describe('Unit name, e.g. "Stück", "kg"'),
 	}),
