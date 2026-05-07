@@ -14,22 +14,6 @@ import { auditAllow } from './audit.js';
 
 // ─── Shared Schemas ───────────────────────────────────────────────────────────
 
-const contactPersonSchema = z.object({
-	salutation: z.string().optional(),
-	firstName: z.string().optional(),
-	lastName: z.string(),
-	emailAddress: z.string().optional(),
-	phoneNumber: z.string().optional(),
-});
-
-const addressEntrySchema = z.object({
-	street: z.string().optional(),
-	zip: z.string().optional(),
-	city: z.string().optional(),
-	countryCode: z.string().length(2).optional(),
-	supplement: z.string().optional(),
-});
-
 function writeErrorResponse(result: { status: number; error: unknown } | null): string {
 	if (!result) return 'Request failed due to a network or server error.';
 	if (result.status === 404) return 'Record not found.';
@@ -38,55 +22,96 @@ function writeErrorResponse(result: { status: number; error: unknown } | null): 
 	return `API error (${result.status}): ${JSON.stringify(result.error, null, 2)}`;
 }
 
-// lineItemSchema: material/service/custom support both name (title, bold) and description (multi-line below title)
 const lineItemSchema = z.discriminatedUnion('type', [
 	z.object({
-		type: z.enum(['material', 'service', 'custom']),
+		type: z
+			.enum(['material', 'service', 'custom'])
+			.describe(
+				'"material" = physical goods (Ware/Material), "service" = services/work (Dienstleistung), "custom" = any other chargeable item. Use "text" for descriptive lines without price.',
+			),
 		name: z
 			.string()
-			.describe('Line item title shown in bold on the PDF. Keep short — 1 line max.'),
+			.describe(
+				'Line item title — displayed in bold on the PDF. Keep to 1 line. For multi-line detail use the description field.',
+			),
 		description: z
 			.string()
 			.optional()
-			.describe('Optional multi-line description shown below the title. Use \\n for line breaks.'),
-		quantity: z.number().describe('Quantity'),
-		unitName: z.string().describe('Unit name, e.g. "Stunden", "Stück"'),
+			.describe(
+				'Optional body text displayed below the bold title on the PDF. Supports multiple lines — use \\n to insert a line break (e.g. "Feature A\\nFeature B\\nFeature C").',
+			),
+		quantity: z.number().describe('Quantity, e.g. 1 or 2.5'),
+		unitName: z
+			.string()
+			.describe(
+				'Unit label printed next to the quantity, e.g. "Stunden" (hours), "Stück" (pieces), "Pauschal" (flat), "Monat" (month)',
+			),
 		unitPrice: z.object({
 			currency: z.literal('EUR'),
-			netAmount: z.string().describe('Net amount as string, e.g. "9.99"'),
-			taxRatePercentage: z.number().describe('Tax rate, e.g. 19 for 19%'),
+			netAmount: z
+				.string()
+				.describe(
+					'Net price per unit as a DECIMAL STRING — must be a string, not a number. Examples: "9.99", "100.00", "1500.00". Do not omit decimal places.',
+				),
+			taxRatePercentage: z
+				.number()
+				.describe(
+					'VAT rate as a percentage integer. German values: 19 (standard/Regelsteuersatz), 7 (reduced/ermäßigt), 0 (tax-free/steuerfrei). Use the value that matches the taxConditions.taxType of the document.',
+				),
 		}),
-		discountPercentage: z.number().min(0).max(100).optional(),
+		discountPercentage: z
+			.number()
+			.min(0)
+			.max(100)
+			.optional()
+			.describe('Line-item discount in percent (0–100), e.g. 10 for a 10% discount. Omit if no discount.'),
 	}),
 	z.object({
-		type: z.literal('text'),
-		name: z.string().describe('Free text line (no price or quantity)'),
+		type: z.literal('text').describe('A descriptive text line without price or quantity — use for section headings or notes within the line items.'),
+		name: z.string().describe('The text to display. Use \\n for line breaks within the text block.'),
 	}),
 ]);
 
 const invoiceAddressSchema = z.union([
 	z.object({
-		contactId: z.string().uuid().describe('Reference to an existing contact'),
+		contactId: z
+			.string()
+			.uuid()
+			.describe(
+				'ID of an existing Lexware contact. PREFERRED — use this whenever the customer or recipient exists as a contact. Lexware will pull the current address and name from the contact record.',
+			),
 	}),
 	z.object({
-		name: z.string(),
-		street: z.string().optional(),
-		zip: z.string().optional(),
-		city: z.string().optional(),
-		countryCode: z.string().length(2).describe('ISO 3166-1 alpha-2, e.g. "DE"'),
+		name: z
+			.string()
+			.describe('Full name or company name of the recipient. Only use this form for one-time recipients not in the contact database.'),
+		street: z.string().optional().describe('Street name and house number, e.g. "Musterstraße 12"'),
+		zip: z.string().optional().describe('Postal code, e.g. "10115"'),
+		city: z.string().optional().describe('City name, e.g. "Berlin"'),
+		countryCode: z
+			.string()
+			.length(2)
+			.describe('ISO 3166-1 alpha-2 country code, e.g. "DE" for Germany, "AT" for Austria, "CH" for Switzerland'),
 	}),
 ]);
 
+const DATE_FORMAT_HINT =
+	'ISO 8601 datetime with timezone offset. Use midnight for the time component and the current German timezone: "+01:00" (CET, Nov–Mar) or "+02:00" (CEST, Apr–Oct). Example for 22 March 2026: "2026-03-22T00:00:00.000+01:00"';
+
 const shippingConditionsSchema = z.object({
-	shippingDate: z.string().describe('Service/delivery date in ISO 8601 format'),
+	shippingDate: z
+		.string()
+		.describe(`Start date of the service or delivery period. Format: ${DATE_FORMAT_HINT}`),
 	shippingEndDate: z
 		.string()
 		.optional()
-		.describe('End date for period types (serviceperiod/deliveryperiod)'),
+		.describe(
+			'End date — REQUIRED when shippingType is "serviceperiod" or "deliveryperiod". Must be on or after shippingDate. Omit for single-date types ("service", "delivery"). Format: same as shippingDate.',
+		),
 	shippingType: z
 		.enum(['service', 'delivery', 'serviceperiod', 'deliveryperiod'])
 		.describe(
-			'"service" = Leistungsdatum, "delivery" = Lieferdatum, "serviceperiod" = Leistungszeitraum, "deliveryperiod" = Lieferzeitraum',
+			'"service" = single Leistungsdatum (most common for services), "delivery" = single Lieferdatum, "serviceperiod" = Leistungszeitraum (range, requires shippingEndDate), "deliveryperiod" = Lieferzeitraum (range, requires shippingEndDate)',
 		),
 });
 
@@ -96,14 +121,25 @@ const paymentConditionsSchema = z
 			.string()
 			.optional()
 			.describe(
-				'Payment term label text shown on the document, e.g. "Zahlungsbedingung: 7 Tage, bis zum 08.04.2026"',
+				'Label printed on the document. OPTIONAL — if omitted, Lexware auto-generates it from paymentTermDuration (recommended). Only set this to override with a custom text, e.g. "Zahlbar sofort ohne Abzug".',
 			),
-		paymentTermLabelLanguage: z.enum(['de', 'en']).optional(),
-		paymentTermDuration: z.number().int().describe('Payment term in days'),
+		paymentTermLabelLanguage: z
+			.enum(['de', 'en'])
+			.optional()
+			.describe('Language for the auto-generated label. Defaults to "de".'),
+		paymentTermDuration: z
+			.number()
+			.int()
+			.describe('Payment due in this many days after the invoice date. E.g. 14 for "within 14 days", 0 for "due immediately".'),
 		paymentDiscountConditions: z
 			.object({
-				discountPercentage: z.number(),
-				discountRange: z.number().int().describe('Days within which discount applies'),
+				discountPercentage: z
+					.number()
+					.describe('Early-payment discount in percent, e.g. 2 for 2% Skonto'),
+				discountRange: z
+					.number()
+					.int()
+					.describe('Number of days within which the discount applies, e.g. 7'),
 			})
 			.optional(),
 	})
@@ -112,20 +148,28 @@ const paymentConditionsSchema = z
 const invoiceSchema = {
 	voucherDate: z
 		.string()
-		.describe('Invoice date in ISO 8601 format, e.g. "2026-03-22T00:00:00.000+01:00"'),
+		.describe(`Document date. Format: ${DATE_FORMAT_HINT}`),
 	address: invoiceAddressSchema,
 	lineItems: z.array(lineItemSchema).min(1),
 	taxConditions: z.object({
 		taxType: z
 			.enum(['net', 'gross', 'vatfree'])
-			.describe('"net" = Netto, "gross" = Brutto, "vatfree" = steuerfrei'),
+			.describe(
+				'"net" = Netto (net prices on document, VAT added on top — typical for B2B), "gross" = Brutto (gross prices incl. VAT — typical for B2C), "vatfree" = steuerfrei (no VAT, e.g. Kleinunternehmer §19 UStG)',
+			),
 	}),
 	shippingConditions: shippingConditionsSchema.describe(
-		'Service/delivery conditions — required by Lexoffice API',
+		'Service or delivery date — required by the Lexoffice API on all document types',
 	),
 	paymentConditions: paymentConditionsSchema,
-	introduction: z.string().optional().describe('Introductory text before line items'),
-	remark: z.string().optional().describe('Closing text after line items'),
+	introduction: z
+		.string()
+		.optional()
+		.describe('Text block printed before the line items (e.g. a greeting or project reference). Use \\n for line breaks.'),
+	remark: z
+		.string()
+		.optional()
+		.describe('Text block printed after the line items (e.g. bank details note, thank-you text). Use \\n for line breaks.'),
 };
 
 // Schema for update tools: requires id + version (optimistic locking)
@@ -1227,9 +1271,9 @@ server.tool(
 			.describe(
 				'purchaseinvoice (Eingangsrechnung), purchasecreditnote, salesinvoice, salescreditnote',
 			),
-		voucherDate: z.string().describe('Voucher date in ISO 8601 format'),
-		voucherNumber: z.string().optional().describe("Supplier's invoice number"),
-		dueDate: z.string().optional(),
+		voucherDate: z.string().describe(`Invoice date. Format: ${DATE_FORMAT_HINT}`),
+		voucherNumber: z.string().optional().describe("Supplier's invoice number as printed on the document"),
+		dueDate: z.string().optional().describe(`Payment due date. Format: ${DATE_FORMAT_HINT}`),
 		contactId: z.string().uuid().optional(),
 		remark: z.string().optional().describe('Internal note'),
 		taxType: z.enum(['net', 'gross', 'vatfree']),
@@ -1279,9 +1323,9 @@ server.tool(
 		id: z.string().uuid().describe('The ID of the voucher to update'),
 		version: z.number().int().describe('Current version (for optimistic locking)'),
 		type: z.enum(['purchaseinvoice', 'purchasecreditnote', 'salesinvoice', 'salescreditnote']),
-		voucherDate: z.string(),
-		voucherNumber: z.string().optional(),
-		dueDate: z.string().optional(),
+		voucherDate: z.string().describe(`Voucher date. Format: ${DATE_FORMAT_HINT}`),
+		voucherNumber: z.string().optional().describe("Supplier's invoice number"),
+		dueDate: z.string().optional().describe(`Due date. Format: ${DATE_FORMAT_HINT}`),
 		contactId: z.string().uuid().optional(),
 		remark: z.string().optional(),
 		taxType: z.enum(['net', 'gross', 'vatfree']),
@@ -1549,7 +1593,7 @@ const quotationCreateSchema = {
 	expirationDate: z
 		.string()
 		.optional()
-		.describe('Expiration date in ISO 8601 format, e.g. "2026-05-22T00:00:00.000+01:00"'),
+		.describe(`Date until which the quotation is valid. Format: ${DATE_FORMAT_HINT}`),
 };
 
 const quotationUpdateSchema = {
@@ -1768,41 +1812,60 @@ server.tool(
 
 const deliveryNoteLineItemSchema = z.discriminatedUnion('type', [
 	z.object({
-		type: z.enum(['material', 'service', 'custom']),
-		name: z.string().describe('Line item title shown in bold on the PDF. Keep short — 1 line max.'),
+		type: z
+			.enum(['material', 'service', 'custom'])
+			.describe('"material" = physical goods, "service" = services, "custom" = other items. Use "text" for header/note lines.'),
+		name: z
+			.string()
+			.describe('Line item title — displayed in bold. Keep to 1 line.'),
 		description: z
 			.string()
 			.optional()
-			.describe('Optional multi-line description shown below the title.'),
-		quantity: z.number().describe('Quantity'),
-		unitName: z.string().describe('Unit name, e.g. "Stück", "kg"'),
+			.describe(
+				'Optional body text displayed below the bold title. Use \\n for line breaks.',
+			),
+		quantity: z.number().describe('Quantity, e.g. 1 or 2.5'),
+		unitName: z.string().describe('Unit label, e.g. "Stück", "kg", "Karton"'),
 	}),
 	z.object({
 		type: z.literal('text'),
-		name: z.string().describe('Free text line'),
+		name: z.string().describe('Descriptive text line without quantity or price. Use \\n for line breaks.'),
 	}),
 ]);
 
 const deliveryNoteBaseSchema = {
 	voucherDate: z
 		.string()
-		.describe('Delivery note date in ISO 8601 format, e.g. "2026-03-22T00:00:00.000+01:00"'),
+		.describe(`Delivery note date. Format: ${DATE_FORMAT_HINT}`),
 	address: invoiceAddressSchema,
 	lineItems: z.array(deliveryNoteLineItemSchema).min(1),
 	taxConditions: z
 		.object({
-			taxType: z.enum(['net', 'gross', 'vatfree']),
+			taxType: z
+				.enum(['net', 'gross', 'vatfree'])
+				.describe('"net" = Netto (B2B), "gross" = Brutto (B2C), "vatfree" = steuerfrei'),
 		})
 		.describe('Required by Lexoffice API even for delivery notes'),
 	shippingConditions: z
 		.object({
-			shippingDate: z.string().describe('Delivery date in ISO 8601 format'),
-			shippingEndDate: z.string().optional(),
-			shippingType: z.enum(['service', 'delivery', 'serviceperiod', 'deliveryperiod']),
+			shippingDate: z.string().describe(`Delivery date or period start. Format: ${DATE_FORMAT_HINT}`),
+			shippingEndDate: z
+				.string()
+				.optional()
+				.describe('Period end date — REQUIRED for "deliveryperiod" type. Format: same as shippingDate.'),
+			shippingType: z
+				.enum(['service', 'delivery', 'serviceperiod', 'deliveryperiod'])
+				.describe('"delivery" = single Lieferdatum, "deliveryperiod" = Lieferzeitraum (requires shippingEndDate)'),
 		})
 		.describe('Required by Lexoffice API'),
-	introduction: z.string().optional(),
-	remark: z.string().optional(),
+	introduction: z
+		.string()
+		.optional()
+		.describe('Text printed before line items. Use \\n for line breaks.'),
+	remark: z
+		.string()
+		.optional()
+		.describe('Text printed after line items. Use \\n for line breaks.'),
 };
 
 server.tool(
@@ -1873,19 +1936,36 @@ const dunningSchema = {
 		.string()
 		.uuid()
 		.describe('ID of the invoice this dunning is for (from get-invoices or get-invoice-details)'),
-	voucherDate: z.string().describe('Dunning date in ISO 8601 format'),
+	voucherDate: z.string().describe(`Dunning date. Format: ${DATE_FORMAT_HINT}`),
 	address: invoiceAddressSchema,
 	lineItems: z.array(lineItemSchema).min(1),
-	taxConditions: z.object({ taxType: z.enum(['net', 'gross', 'vatfree']) }),
+	taxConditions: z.object({
+		taxType: z
+			.enum(['net', 'gross', 'vatfree'])
+			.describe('"net" = Netto, "gross" = Brutto, "vatfree" = steuerfrei'),
+	}),
 	shippingConditions: z
 		.object({
-			shippingDate: z.string(),
-			shippingEndDate: z.string().optional(),
-			shippingType: z.enum(['service', 'delivery', 'serviceperiod', 'deliveryperiod']),
+			shippingDate: z
+				.string()
+				.describe(`Service date for the dunning. Format: ${DATE_FORMAT_HINT}`),
+			shippingEndDate: z
+				.string()
+				.optional()
+				.describe('Required only for period types (serviceperiod/deliveryperiod).'),
+			shippingType: z
+				.enum(['service', 'delivery', 'serviceperiod', 'deliveryperiod'])
+				.describe('"service" = Leistungsdatum (most common for dunnings)'),
 		})
 		.describe('Required by Lexoffice API'),
-	introduction: z.string().optional(),
-	remark: z.string().optional(),
+	introduction: z
+		.string()
+		.optional()
+		.describe('Text printed before line items. Use \\n for line breaks.'),
+	remark: z
+		.string()
+		.optional()
+		.describe('Text printed after line items. Use \\n for line breaks.'),
 };
 
 server.tool(
