@@ -1,0 +1,2520 @@
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { z } from 'zod';
+
+import {
+	makeLexwareOfficeRequest,
+	makeLexwareOfficeFileRequest,
+	makeLexwareOfficeWriteRequest,
+	makeLexwareOfficeMultipartRequest,
+} from './helper.js';
+import { logger } from './logger.js';
+import { governance, finalizeHint, draftHint } from './governance.js';
+import { auditAllow } from './audit.js';
+
+// ─── Shared Schemas ───────────────────────────────────────────────────────────
+
+const contactPersonSchema = z.object({
+	salutation: z.string().optional(),
+	firstName: z.string().optional(),
+	lastName: z.string(),
+	emailAddress: z.string().optional(),
+	phoneNumber: z.string().optional(),
+});
+
+const addressEntrySchema = z.object({
+	street: z.string().optional(),
+	zip: z.string().optional(),
+	city: z.string().optional(),
+	countryCode: z.string().length(2).optional(),
+	supplement: z.string().optional(),
+});
+
+function writeErrorResponse(result: { status: number; error: unknown } | null): string {
+	if (!result) return 'Request failed due to a network or server error.';
+	if (result.status === 404) return 'Record not found.';
+	if (result.status === 409) return 'Version conflict — please re-fetch the record and try again.';
+	if (result.status === 401 || result.status === 403) return 'Authentication or permission error.';
+	return `API error (${result.status}): ${JSON.stringify(result.error, null, 2)}`;
+}
+
+// lineItemSchema: material/service/custom support both name (title, bold) and description (multi-line below title)
+const lineItemSchema = z.discriminatedUnion('type', [
+	z.object({
+		type: z.enum(['material', 'service', 'custom']),
+		name: z
+			.string()
+			.describe('Line item title shown in bold on the PDF. Keep short — 1 line max.'),
+		description: z
+			.string()
+			.optional()
+			.describe('Optional multi-line description shown below the title. Use \\n for line breaks.'),
+		quantity: z.number().describe('Quantity'),
+		unitName: z.string().describe('Unit name, e.g. "Stunden", "Stück"'),
+		unitPrice: z.object({
+			currency: z.literal('EUR'),
+			netAmount: z.string().describe('Net amount as string, e.g. "9.99"'),
+			taxRatePercentage: z.number().describe('Tax rate, e.g. 19 for 19%'),
+		}),
+		discountPercentage: z.number().min(0).max(100).optional(),
+	}),
+	z.object({
+		type: z.literal('text'),
+		name: z.string().describe('Free text line (no price or quantity)'),
+	}),
+]);
+
+const invoiceAddressSchema = z.union([
+	z.object({
+		contactId: z.string().uuid().describe('Reference to an existing contact'),
+	}),
+	z.object({
+		name: z.string(),
+		street: z.string().optional(),
+		zip: z.string().optional(),
+		city: z.string().optional(),
+		countryCode: z.string().length(2).describe('ISO 3166-1 alpha-2, e.g. "DE"'),
+	}),
+]);
+
+const shippingConditionsSchema = z.object({
+	shippingDate: z.string().describe('Service/delivery date in ISO 8601 format'),
+	shippingEndDate: z
+		.string()
+		.optional()
+		.describe('End date for period types (serviceperiod/deliveryperiod)'),
+	shippingType: z
+		.enum(['service', 'delivery', 'serviceperiod', 'deliveryperiod'])
+		.describe(
+			'"service" = Leistungsdatum, "delivery" = Lieferdatum, "serviceperiod" = Leistungszeitraum, "deliveryperiod" = Lieferzeitraum',
+		),
+});
+
+const paymentConditionsSchema = z
+	.object({
+		paymentTermLabel: z
+			.string()
+			.optional()
+			.describe(
+				'Payment term label text shown on the document, e.g. "Zahlungsbedingung: 7 Tage, bis zum 08.04.2026"',
+			),
+		paymentTermLabelLanguage: z.enum(['de', 'en']).optional(),
+		paymentTermDuration: z.number().int().describe('Payment term in days'),
+		paymentDiscountConditions: z
+			.object({
+				discountPercentage: z.number(),
+				discountRange: z.number().int().describe('Days within which discount applies'),
+			})
+			.optional(),
+	})
+	.optional();
+
+const invoiceSchema = {
+	voucherDate: z
+		.string()
+		.describe('Invoice date in ISO 8601 format, e.g. "2026-03-22T00:00:00.000+01:00"'),
+	address: invoiceAddressSchema,
+	lineItems: z.array(lineItemSchema).min(1),
+	taxConditions: z.object({
+		taxType: z
+			.enum(['net', 'gross', 'vatfree'])
+			.describe('"net" = Netto, "gross" = Brutto, "vatfree" = steuerfrei'),
+	}),
+	shippingConditions: shippingConditionsSchema.describe(
+		'Service/delivery conditions — required by Lexoffice API',
+	),
+	paymentConditions: paymentConditionsSchema,
+	introduction: z.string().optional().describe('Introductory text before line items'),
+	remark: z.string().optional().describe('Closing text after line items'),
+};
+
+// Schema for update tools: requires id + version (optimistic locking)
+const updateDocSchema = {
+	id: z.string().uuid().describe('ID of the draft to update'),
+	version: z
+		.number()
+		.int()
+		.describe('Current version for optimistic locking — get it from the details endpoint'),
+	...invoiceSchema,
+};
+
+const articlePriceSchema = z.object({
+	leadingPrice: z
+		.enum(['NET', 'GROSS'])
+		.describe('"NET" to specify net price, "GROSS" to specify gross price'),
+	netPrice: z.number().optional().describe('Net price — required when leadingPrice is "NET"'),
+	grossPrice: z
+		.number()
+		.optional()
+		.describe('Gross price incl. tax — required when leadingPrice is "GROSS"'),
+	taxRate: z.number().describe('Tax rate percentage, e.g. 19 for 19%, 7 for 7%, 0 for tax-free'),
+});
+
+// ─── Server ───────────────────────────────────────────────────────────────────
+
+const server = new McpServer({
+	name: 'lexware-office',
+	version: '2.0.0',
+});
+
+// ─── Read Tools (always available) ───────────────────────────────────────────
+
+server.tool(
+	'get-invoices',
+	'Get a list of invoices from Lexware Office',
+	{
+		status: z
+			.array(z.enum(['open', 'draft', 'paid', 'paidoff', 'voided']))
+			.optional()
+			.default(['open', 'draft', 'paid', 'paidoff', 'voided']),
+		page: z.number().min(0).optional().default(0).describe('page number; starts at 0'),
+		size: z.number().min(1).max(250).optional().default(250).describe('results per page'),
+	},
+	async ({ status, page, size }) => {
+		const url = `/v1/voucherlist?voucherType=invoice&voucherStatus=${status.join(',')}&page=${page}&size=${size}`;
+		const data = await makeLexwareOfficeRequest<any>(url);
+		const vouchers = data?.content;
+
+		if (!vouchers || vouchers.length === 0) {
+			return { content: [{ type: 'text', text: 'No invoices found' }] };
+		}
+
+		return {
+			content: [
+				{
+					type: 'text',
+					text: `There are ${data.totalElements} invoices in total (showing ${vouchers.length} on page ${page}):\n\n${JSON.stringify(vouchers, null, 2)}`,
+				},
+			],
+		};
+	},
+);
+
+server.tool(
+	'get-invoice-details',
+	'Get details of an invoice from Lexware Office. The response includes a "version" field needed for update-invoice.',
+	{
+		id: z.string().uuid().describe('The id of the invoice'),
+	},
+	async ({ id }) => {
+		const data = await makeLexwareOfficeRequest<any>(`/v1/invoices/${id}`);
+
+		if (!data) {
+			return { content: [{ type: 'text', text: 'Failed to retrieve invoice data' }] };
+		}
+
+		return {
+			content: [{ type: 'text', text: `Invoice details:\n\n${JSON.stringify(data, null, 2)}` }],
+		};
+	},
+);
+
+server.tool(
+	'get-contacts',
+	'Get contacts from Lexware Office with optional filters (combined with logical AND)',
+	{
+		email: z.string().min(3).optional().describe(
+			'Filter by email address (substring, % and _ wildcards allowed)',
+		),
+		name: z.string().min(3).optional().describe(
+			'Filter by name (substring, % and _ wildcards allowed)',
+		),
+		number: z.number().int().optional().describe('Filter by contact number (customer or vendor number)'),
+		customer: z.boolean().optional().describe('true = only customers, false = exclude customers'),
+		vendor: z.boolean().optional().describe('true = only vendors, false = exclude vendors'),
+		archived: z
+			.enum(['active', 'archived', 'all'])
+			.optional()
+			.default('active')
+			.describe('"active" = non-archived (default), "archived" = archived only, "all" = both'),
+		page: z.number().min(0).optional().default(0).describe('page number; starts at 0'),
+		size: z.number().min(1).max(250).optional().default(250).describe('results per page'),
+	},
+	async ({ email, name, number, customer, vendor, archived, page, size }) => {
+		const params = new URLSearchParams({ page: String(page), size: String(size) });
+		if (email) params.append('email', email);
+		if (name) params.append('name', name);
+		if (number !== undefined) params.append('number', number.toString());
+		if (customer !== undefined) params.append('customer', customer.toString());
+		if (vendor !== undefined) params.append('vendor', vendor.toString());
+		if (archived === 'active') params.append('archived', 'false');
+		else if (archived === 'archived') params.append('archived', 'true');
+		// 'all' → don't filter
+
+		const data = await makeLexwareOfficeRequest<any>(`/v1/contacts?${params.toString()}`);
+
+		if (!data) {
+			return { content: [{ type: 'text', text: 'Failed to retrieve contacts' }] };
+		}
+
+		return {
+			content: [{ type: 'text', text: `Contacts:\n\n${JSON.stringify(data, null, 2)}` }],
+		};
+	},
+);
+
+server.tool(
+	'get-contact-details',
+	'Get details of a single contact from Lexware Office by its ID. The response includes a "version" field needed for update-contact.',
+	{
+		id: z.string().uuid().describe('The ID of the contact'),
+	},
+	async ({ id }) => {
+		const data = await makeLexwareOfficeRequest<any>(`/v1/contacts/${id}`);
+
+		if (!data) {
+			return { content: [{ type: 'text', text: 'Failed to retrieve contact data' }] };
+		}
+
+		return {
+			content: [{ type: 'text', text: `Contact details:\n\n${JSON.stringify(data, null, 2)}` }],
+		};
+	},
+);
+
+server.tool(
+	'list-posting-categories',
+	'Retrieve list of posting categories for bookkeeping vouchers',
+	{
+		type: z.enum(['income', 'outgo']).optional().describe('Filter posting categories by type'),
+	},
+	async ({ type }) => {
+		const data = await makeLexwareOfficeRequest<any>('/v1/posting-categories');
+
+		if (!data) {
+			return { content: [{ type: 'text', text: 'Failed to retrieve posting categories' }] };
+		}
+
+		const filtered = type ? data.filter((c: any) => c.type === type) : data;
+
+		return {
+			content: [
+				{ type: 'text', text: `Posting Categories:\n\n${JSON.stringify(filtered, null, 2)}` },
+			],
+		};
+	},
+);
+
+server.tool(
+	'list-countries',
+	'Retrieve list of countries with their tax classifications: "de" (Germany), "intraCommunity" (EU, Innergemeinschaftliche Lieferung), "thirdPartyCountry" (non-EU)',
+	{
+		taxClassification: z
+			.enum(['de', 'intraCommunity', 'thirdPartyCountry'])
+			.optional()
+			.describe('Filter by tax classification'),
+	},
+	async ({ taxClassification }) => {
+		const data = await makeLexwareOfficeRequest<any>('/v1/countries');
+
+		if (!data) {
+			return { content: [{ type: 'text', text: 'Failed to retrieve countries' }] };
+		}
+
+		const filtered = taxClassification
+			? data.filter((c: any) => c.taxClassification === taxClassification)
+			: data;
+
+		return {
+			content: [{ type: 'text', text: `Countries:\n\n${JSON.stringify(filtered, null, 2)}` }],
+		};
+	},
+);
+
+server.tool(
+	'get-vouchers',
+	'Get a list of bookkeeping vouchers (Eingangsbelege/Ausgangsbelege). Types: purchaseinvoice (Ausgaben), purchasecreditnote, salesinvoice (Einnahmen), salescreditnote.',
+	{
+		voucherType: z
+			.array(
+				z.enum(['purchaseinvoice', 'purchasecreditnote', 'salesinvoice', 'salescreditnote']),
+			)
+			.optional()
+			.default(['purchaseinvoice', 'purchasecreditnote', 'salesinvoice', 'salescreditnote']),
+		voucherStatus: z
+			.array(
+				z.enum([
+					'unchecked',
+					'open',
+					'paid',
+					'paidoff',
+					'voided',
+					'transferred',
+					'sepadebit',
+				]),
+			)
+			.optional()
+			.default(['unchecked', 'open', 'paid', 'paidoff', 'voided', 'transferred', 'sepadebit']),
+		page: z.number().min(0).optional().default(0).describe('page number; starts at 0'),
+		size: z.number().min(1).max(250).optional().default(250).describe('results per page'),
+	},
+	async ({ voucherType, voucherStatus, page, size }) => {
+		const url = `/v1/voucherlist?voucherType=${voucherType.join(',')}&voucherStatus=${voucherStatus.join(',')}&page=${page}&size=${size}`;
+		const data = await makeLexwareOfficeRequest<any>(url);
+		const vouchers = data?.content;
+
+		if (!vouchers || vouchers.length === 0) {
+			return { content: [{ type: 'text', text: 'No vouchers found' }] };
+		}
+
+		return {
+			content: [
+				{
+					type: 'text',
+					text: `There are ${data.totalElements} vouchers in total (showing ${vouchers.length} on page ${page}):\n\n${JSON.stringify(vouchers, null, 2)}`,
+				},
+			],
+		};
+	},
+);
+
+server.tool(
+	'get-voucher-details',
+	'Get details of a bookkeeping voucher by its ID. The response includes a "version" field needed for update-voucher.',
+	{
+		id: z.string().uuid().describe('The id of the voucher'),
+	},
+	async ({ id }) => {
+		const data = await makeLexwareOfficeRequest<any>(`/v1/vouchers/${id}`);
+
+		if (!data) {
+			return { content: [{ type: 'text', text: 'Failed to retrieve voucher data' }] };
+		}
+
+		return {
+			content: [
+				{ type: 'text', text: `Voucher details:\n\n${JSON.stringify(data, null, 2)}` },
+			],
+		};
+	},
+);
+
+server.tool(
+	'get-file',
+	'Download a file (PDF or XML) from Lexware Office by its file ID. File IDs are in the "files.documentFileId" field of voucher or invoice details.',
+	{
+		id: z.string().uuid().describe('The file ID from files.documentFileId'),
+		format: z
+			.enum(['pdf', 'xml'])
+			.optional()
+			.default('pdf')
+			.describe('"pdf" (default) or "xml" (XRechnung)'),
+	},
+	async ({ id, format }) => {
+		const accept = format === 'xml' ? 'application/xml' : 'application/pdf';
+		const fileData = await makeLexwareOfficeFileRequest(`/v1/files/${id}`, accept);
+
+		if (!fileData) {
+			return { content: [{ type: 'text', text: 'Failed to retrieve file' }] };
+		}
+
+		return {
+			content: [
+				{
+					type: 'resource',
+					resource: {
+						uri: `lexware://files/${id}`,
+						mimeType: fileData.mimeType,
+						blob: fileData.data.toString('base64'),
+					},
+				},
+			],
+		};
+	},
+);
+
+server.tool(
+	'get-document-file',
+	'Download the PDF of a document (invoice, quotation, credit note, order confirmation, delivery note, dunning, down-payment invoice) by its document ID.',
+	{
+		docType: z
+			.enum([
+				'invoices',
+				'credit-notes',
+				'quotations',
+				'order-confirmations',
+				'delivery-notes',
+				'dunnings',
+				'down-payment-invoices',
+			])
+			.describe('The type of document'),
+		id: z.string().uuid().describe('The ID of the document'),
+	},
+	async ({ docType, id }) => {
+		const fileData = await makeLexwareOfficeFileRequest(
+			`/v1/${docType}/${id}/file`,
+			'application/pdf',
+		);
+
+		if (!fileData) {
+			return {
+				content: [
+					{
+						type: 'text',
+						text: 'Failed to retrieve document file. Ensure the document is finalized.',
+					},
+				],
+			};
+		}
+
+		return {
+			content: [
+				{
+					type: 'resource',
+					resource: {
+						uri: `lexware://${docType}/${id}/file`,
+						mimeType: fileData.mimeType,
+						blob: fileData.data.toString('base64'),
+					},
+				},
+			],
+		};
+	},
+);
+
+server.tool(
+	'get-payments',
+	'Get payment information for an invoice or voucher from Lexware Office.',
+	{
+		id: z.string().uuid().describe('The ID of the invoice or voucher'),
+	},
+	async ({ id }) => {
+		const LEXOFFICE_API_BASE = 'https://api.lexoffice.io';
+		const response = await fetch(`${LEXOFFICE_API_BASE}/v1/payments/${id}`, {
+			headers: {
+				Accept: 'application/json',
+				Authorization: `Bearer ${process.env.LEXWARE_OFFICE_API_KEY!}`,
+			},
+		}).catch(() => null);
+
+		if (!response) {
+			return { content: [{ type: 'text', text: 'Network error retrieving payment information' }] };
+		}
+
+		let body: unknown;
+		try {
+			body = await response.json();
+		} catch {
+			body = null;
+		}
+
+		if (!response.ok) {
+			return {
+				content: [
+					{ type: 'text', text: `API error ${response.status}: ${JSON.stringify(body)}` },
+				],
+			};
+		}
+
+		return {
+			content: [
+				{
+					type: 'text',
+					text: `Payment information:\n\n${JSON.stringify(body, null, 2)}`,
+				},
+			],
+		};
+	},
+);
+
+server.tool(
+	'get-payment-conditions',
+	'Retrieve available payment conditions (Zahlungsbedingungen) from Lexware Office.',
+	{},
+	async () => {
+		const data = await makeLexwareOfficeRequest<any>('/v1/payment-conditions');
+
+		if (!data) {
+			return { content: [{ type: 'text', text: 'Failed to retrieve payment conditions' }] };
+		}
+
+		return {
+			content: [
+				{ type: 'text', text: `Payment conditions:\n\n${JSON.stringify(data, null, 2)}` },
+			],
+		};
+	},
+);
+
+server.tool(
+	'get-profile',
+	'Get the company profile (Unternehmensprofil) from Lexware Office.',
+	{},
+	async () => {
+		const data = await makeLexwareOfficeRequest<any>('/v1/profile');
+
+		if (!data) {
+			return { content: [{ type: 'text', text: 'Failed to retrieve profile data' }] };
+		}
+
+		return {
+			content: [{ type: 'text', text: `Company profile:\n\n${JSON.stringify(data, null, 2)}` }],
+		};
+	},
+);
+
+server.tool(
+	'list-print-layouts',
+	'Retrieve available print layouts (Drucklayouts) from Lexware Office.',
+	{},
+	async () => {
+		const data = await makeLexwareOfficeRequest<any>('/v1/print-layouts');
+
+		if (!data) {
+			return { content: [{ type: 'text', text: 'Failed to retrieve print layouts' }] };
+		}
+
+		return {
+			content: [{ type: 'text', text: `Print layouts:\n\n${JSON.stringify(data, null, 2)}` }],
+		};
+	},
+);
+
+server.tool(
+	'get-recurring-templates',
+	'Get a list of recurring invoice templates (Wiederkehrende Vorlagen) from Lexware Office.',
+	{
+		page: z.number().min(0).optional().default(0).describe('page number; starts at 0'),
+		size: z.number().min(1).max(250).optional().default(250).describe('results per page'),
+	},
+	async ({ page, size }) => {
+		const data = await makeLexwareOfficeRequest<any>(
+			`/v1/recurring-templates?page=${page}&size=${size}`,
+		);
+
+		if (!data) {
+			return { content: [{ type: 'text', text: 'Failed to retrieve recurring templates' }] };
+		}
+
+		return {
+			content: [
+				{ type: 'text', text: `Recurring templates:\n\n${JSON.stringify(data, null, 2)}` },
+			],
+		};
+	},
+);
+
+server.tool(
+	'get-articles',
+	'Get a list of articles (Artikel/Produkte) from Lexware Office with optional filters.',
+	{
+		articleNumber: z.string().optional().describe('Filter by article number'),
+		name: z.string().optional().describe('Filter by article name (substring)'),
+		type: z.enum(['PRODUCT', 'SERVICE']).optional().describe('Filter by article type'),
+		archived: z
+			.enum(['active', 'archived', 'all'])
+			.optional()
+			.default('active')
+			.describe('"active" = non-archived (default), "archived" = archived only, "all" = both'),
+		page: z.number().min(0).optional().default(0).describe('page number; starts at 0'),
+		size: z.number().min(1).max(250).optional().default(250).describe('results per page'),
+	},
+	async ({ articleNumber, name, type, archived, page, size }) => {
+		const params = new URLSearchParams({ page: String(page), size: String(size) });
+		if (articleNumber) params.append('articleNumber', articleNumber);
+		if (name) params.append('name', name);
+		if (type) params.append('type', type);
+		if (archived === 'active') params.append('archived', 'false');
+		else if (archived === 'archived') params.append('archived', 'true');
+
+		const data = await makeLexwareOfficeRequest<any>(`/v1/articles?${params.toString()}`);
+
+		if (!data) {
+			return { content: [{ type: 'text', text: 'Failed to retrieve articles' }] };
+		}
+
+		return {
+			content: [{ type: 'text', text: `Articles:\n\n${JSON.stringify(data, null, 2)}` }],
+		};
+	},
+);
+
+server.tool(
+	'get-article-details',
+	'Get details of an article (Artikel/Produkt) by its ID. The response includes a "version" field needed for update-article.',
+	{
+		id: z.string().uuid().describe('The ID of the article'),
+	},
+	async ({ id }) => {
+		const data = await makeLexwareOfficeRequest<any>(`/v1/articles/${id}`);
+
+		if (!data) {
+			return { content: [{ type: 'text', text: 'Failed to retrieve article data' }] };
+		}
+
+		return {
+			content: [{ type: 'text', text: `Article details:\n\n${JSON.stringify(data, null, 2)}` }],
+		};
+	},
+);
+
+server.tool(
+	'get-quotations',
+	'Get a list of quotations (Angebote) from Lexware Office.',
+	{
+		status: z
+			.array(z.enum(['draft', 'open', 'accepted', 'rejected', 'voided']))
+			.optional()
+			.default(['draft', 'open', 'accepted', 'rejected', 'voided']),
+		page: z.number().min(0).optional().default(0).describe('page number; starts at 0'),
+		size: z.number().min(1).max(250).optional().default(250).describe('results per page'),
+	},
+	async ({ status, page, size }) => {
+		const url = `/v1/voucherlist?voucherType=quotation&voucherStatus=${status.join(',')}&page=${page}&size=${size}`;
+		const data = await makeLexwareOfficeRequest<any>(url);
+		const vouchers = data?.content;
+
+		if (!vouchers || vouchers.length === 0) {
+			return { content: [{ type: 'text', text: 'No quotations found' }] };
+		}
+
+		return {
+			content: [
+				{
+					type: 'text',
+					text: `There are ${data.totalElements} quotations in total (showing ${vouchers.length} on page ${page}):\n\n${JSON.stringify(vouchers, null, 2)}`,
+				},
+			],
+		};
+	},
+);
+
+server.tool(
+	'get-quotation-details',
+	'Get details of a quotation (Angebot) by its ID. The response includes a "version" field needed for update-quotation.',
+	{
+		id: z.string().uuid().describe('The ID of the quotation'),
+	},
+	async ({ id }) => {
+		const data = await makeLexwareOfficeRequest<any>(`/v1/quotations/${id}`);
+
+		if (!data) {
+			return { content: [{ type: 'text', text: 'Failed to retrieve quotation data' }] };
+		}
+
+		return {
+			content: [
+				{ type: 'text', text: `Quotation details:\n\n${JSON.stringify(data, null, 2)}` },
+			],
+		};
+	},
+);
+
+server.tool(
+	'get-credit-notes',
+	'Get a list of credit notes (Gutschriften) from Lexware Office.',
+	{
+		status: z
+			.array(z.enum(['draft', 'open', 'paid', 'voided']))
+			.optional()
+			.default(['draft', 'open', 'paid', 'voided']),
+		page: z.number().min(0).optional().default(0).describe('page number; starts at 0'),
+		size: z.number().min(1).max(250).optional().default(250).describe('results per page'),
+	},
+	async ({ status, page, size }) => {
+		const url = `/v1/voucherlist?voucherType=creditnote&voucherStatus=${status.join(',')}&page=${page}&size=${size}`;
+		const data = await makeLexwareOfficeRequest<any>(url);
+		const vouchers = data?.content;
+
+		if (!vouchers || vouchers.length === 0) {
+			return { content: [{ type: 'text', text: 'No credit notes found' }] };
+		}
+
+		return {
+			content: [
+				{
+					type: 'text',
+					text: `There are ${data.totalElements} credit notes in total (showing ${vouchers.length} on page ${page}):\n\n${JSON.stringify(vouchers, null, 2)}`,
+				},
+			],
+		};
+	},
+);
+
+server.tool(
+	'get-credit-note-details',
+	'Get details of a credit note (Gutschrift) by its ID. The response includes a "version" field needed for update-credit-note.',
+	{
+		id: z.string().uuid().describe('The ID of the credit note'),
+	},
+	async ({ id }) => {
+		const data = await makeLexwareOfficeRequest<any>(`/v1/credit-notes/${id}`);
+
+		if (!data) {
+			return { content: [{ type: 'text', text: 'Failed to retrieve credit note data' }] };
+		}
+
+		return {
+			content: [
+				{ type: 'text', text: `Credit note details:\n\n${JSON.stringify(data, null, 2)}` },
+			],
+		};
+	},
+);
+
+server.tool(
+	'get-order-confirmations',
+	'Get a list of order confirmations (Auftragsbestätigungen) from Lexware Office.',
+	{
+		status: z
+			.array(z.enum(['draft', 'open', 'fulfilled', 'voided']))
+			.optional()
+			.default(['draft', 'open', 'fulfilled', 'voided']),
+		page: z.number().min(0).optional().default(0).describe('page number; starts at 0'),
+		size: z.number().min(1).max(250).optional().default(250).describe('results per page'),
+	},
+	async ({ status, page, size }) => {
+		const url = `/v1/voucherlist?voucherType=orderconfirmation&voucherStatus=${status.join(',')}&page=${page}&size=${size}`;
+		const data = await makeLexwareOfficeRequest<any>(url);
+		const vouchers = data?.content;
+
+		if (!vouchers || vouchers.length === 0) {
+			return { content: [{ type: 'text', text: 'No order confirmations found' }] };
+		}
+
+		return {
+			content: [
+				{
+					type: 'text',
+					text: `There are ${data.totalElements} order confirmations in total (showing ${vouchers.length} on page ${page}):\n\n${JSON.stringify(vouchers, null, 2)}`,
+				},
+			],
+		};
+	},
+);
+
+server.tool(
+	'get-order-confirmation-details',
+	'Get details of an order confirmation (Auftragsbestätigung) by its ID. The response includes a "version" field needed for update-order-confirmation.',
+	{
+		id: z.string().uuid().describe('The ID of the order confirmation'),
+	},
+	async ({ id }) => {
+		const data = await makeLexwareOfficeRequest<any>(`/v1/order-confirmations/${id}`);
+
+		if (!data) {
+			return { content: [{ type: 'text', text: 'Failed to retrieve order confirmation data' }] };
+		}
+
+		return {
+			content: [
+				{
+					type: 'text',
+					text: `Order confirmation details:\n\n${JSON.stringify(data, null, 2)}`,
+				},
+			],
+		};
+	},
+);
+
+server.tool(
+	'get-delivery-notes',
+	'Get a list of delivery notes (Lieferscheine) from Lexware Office.',
+	{
+		status: z
+			.array(z.enum(['draft', 'open', 'fulfilled', 'voided']))
+			.optional()
+			.default(['draft', 'open', 'fulfilled', 'voided']),
+		page: z.number().min(0).optional().default(0).describe('page number; starts at 0'),
+		size: z.number().min(1).max(250).optional().default(250).describe('results per page'),
+	},
+	async ({ status, page, size }) => {
+		const url = `/v1/voucherlist?voucherType=deliverynote&voucherStatus=${status.join(',')}&page=${page}&size=${size}`;
+		const data = await makeLexwareOfficeRequest<any>(url);
+		const vouchers = data?.content;
+
+		if (!vouchers || vouchers.length === 0) {
+			return { content: [{ type: 'text', text: 'No delivery notes found' }] };
+		}
+
+		return {
+			content: [
+				{
+					type: 'text',
+					text: `There are ${data.totalElements} delivery notes in total (showing ${vouchers.length} on page ${page}):\n\n${JSON.stringify(vouchers, null, 2)}`,
+				},
+			],
+		};
+	},
+);
+
+server.tool(
+	'get-delivery-note-details',
+	'Get details of a delivery note (Lieferschein) by its ID. The response includes a "version" field needed for update-delivery-note.',
+	{
+		id: z.string().uuid().describe('The ID of the delivery note'),
+	},
+	async ({ id }) => {
+		const data = await makeLexwareOfficeRequest<any>(`/v1/delivery-notes/${id}`);
+
+		if (!data) {
+			return { content: [{ type: 'text', text: 'Failed to retrieve delivery note data' }] };
+		}
+
+		return {
+			content: [
+				{ type: 'text', text: `Delivery note details:\n\n${JSON.stringify(data, null, 2)}` },
+			],
+		};
+	},
+);
+
+server.tool(
+	'get-down-payment-invoice-details',
+	'Get details of a down payment invoice (Anzahlungsrechnung) by its ID.',
+	{
+		id: z.string().uuid().describe('The ID of the down payment invoice'),
+	},
+	async ({ id }) => {
+		const data = await makeLexwareOfficeRequest<any>(`/v1/down-payment-invoices/${id}`);
+
+		if (!data) {
+			return {
+				content: [{ type: 'text', text: 'Failed to retrieve down payment invoice data' }],
+			};
+		}
+
+		return {
+			content: [
+				{
+					type: 'text',
+					text: `Down payment invoice details:\n\n${JSON.stringify(data, null, 2)}`,
+				},
+			],
+		};
+	},
+);
+
+server.tool(
+	'get-dunnings',
+	'Helper: Lexware Office does not support listing dunnings. Use get-dunning-details with a known ID instead. Dunning IDs are in the relatedVouchers field of the associated invoice.',
+	{},
+	async () => ({
+		content: [
+			{
+				type: 'text',
+				text: 'The Lexware Office API does not support listing dunnings. Use get-dunning-details with a known dunning ID. Find dunning IDs in the relatedVouchers field of the associated invoice (use get-invoice-details).',
+			},
+		],
+	}),
+);
+
+server.tool(
+	'get-dunning-details',
+	'Get details of a dunning notice (Mahnung) by its ID.',
+	{
+		id: z.string().uuid().describe('The ID of the dunning'),
+	},
+	async ({ id }) => {
+		const data = await makeLexwareOfficeRequest<any>(`/v1/dunnings/${id}`);
+
+		if (!data) {
+			return { content: [{ type: 'text', text: 'Failed to retrieve dunning data' }] };
+		}
+
+		return {
+			content: [{ type: 'text', text: `Dunning details:\n\n${JSON.stringify(data, null, 2)}` }],
+		};
+	},
+);
+
+server.tool(
+	'list-event-subscriptions',
+	'Retrieve all webhook event subscriptions from Lexware Office.',
+	{},
+	async () => {
+		const data = await makeLexwareOfficeRequest<any>('/v1/event-subscriptions');
+
+		if (!data) {
+			return { content: [{ type: 'text', text: 'Failed to retrieve event subscriptions' }] };
+		}
+
+		return {
+			content: [
+				{
+					type: 'text',
+					text: `Event subscriptions:\n\n${JSON.stringify(data, null, 2)}`,
+				},
+			],
+		};
+	},
+);
+
+server.tool(
+	'get-event-subscription',
+	'Retrieve a specific webhook event subscription by its ID.',
+	{
+		id: z.string().uuid().describe('The ID of the event subscription'),
+	},
+	async ({ id }) => {
+		const data = await makeLexwareOfficeRequest<any>(`/v1/event-subscriptions/${id}`);
+
+		if (!data) {
+			return { content: [{ type: 'text', text: 'Failed to retrieve event subscription' }] };
+		}
+
+		return {
+			content: [
+				{ type: 'text', text: `Event subscription:\n\n${JSON.stringify(data, null, 2)}` },
+			],
+		};
+	},
+);
+
+// ─── Write / Create Tools ─────────────────────────────────────────────────────
+
+server.tool(
+	'create-contact',
+	'Create a new contact in Lexware Office. Provide companyName for a company, or firstName/lastName for a person.',
+	{
+		customer: z
+			.string()
+			.optional()
+			.transform((v) => v === 'true')
+			.describe('Set to "true" to assign the customer role'),
+		vendor: z
+			.string()
+			.optional()
+			.transform((v) => v === 'true')
+			.describe('Set to "true" to assign the vendor role'),
+		companyName: z
+			.string()
+			.optional()
+			.describe('Company name — provide either companyName or lastName, not both'),
+		taxNumber: z.string().optional().describe('Tax number of the company'),
+		vatRegistrationId: z.string().optional().describe('VAT registration ID of the company'),
+		firstName: z.string().optional(),
+		lastName: z.string().optional().describe('Required if companyName is not provided'),
+		salutation: z.string().optional(),
+		note: z.string().optional(),
+	},
+	async ({
+		customer,
+		vendor,
+		companyName,
+		taxNumber,
+		vatRegistrationId,
+		firstName,
+		lastName,
+		salutation,
+		note,
+	}) => {
+		const result = await makeLexwareOfficeWriteRequest<any>('/v1/contacts', 'POST', {
+			version: 0,
+			roles: {
+				...(customer ? { customer: {} } : {}),
+				...(vendor ? { vendor: {} } : {}),
+			},
+			...(companyName
+				? {
+						company: {
+							name: companyName,
+							...(taxNumber ? { taxNumber } : {}),
+							...(vatRegistrationId ? { vatRegistrationId } : {}),
+						},
+					}
+				: {}),
+			...(lastName || firstName
+				? {
+						person: {
+							...(salutation ? { salutation } : {}),
+							...(firstName ? { firstName } : {}),
+							...(lastName ? { lastName } : {}),
+						},
+					}
+				: {}),
+			...(note ? { note } : {}),
+		});
+
+		if (!result || !result.ok) {
+			return {
+				content: [
+					{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+				],
+			};
+		}
+
+		return {
+			content: [
+				{
+					type: 'text',
+					text: `Contact created successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
+				},
+			],
+		};
+	},
+);
+
+server.tool(
+	'update-contact',
+	'Update an existing contact in Lexware Office. Requires the current version number for optimistic locking (get it from get-contact-details).',
+	{
+		id: z.string().uuid().describe('The ID of the contact to update'),
+		version: z.number().int().describe('Current version (for optimistic locking)'),
+		customer: z
+			.string()
+			.optional()
+			.transform((v) => v === 'true')
+			.describe('Set to "true" to assign the customer role'),
+		vendor: z
+			.string()
+			.optional()
+			.transform((v) => v === 'true')
+			.describe('Set to "true" to assign the vendor role'),
+		companyName: z.string().optional(),
+		taxNumber: z.string().optional(),
+		vatRegistrationId: z.string().optional(),
+		firstName: z.string().optional(),
+		lastName: z.string().optional(),
+		salutation: z.string().optional(),
+		note: z.string().optional(),
+	},
+	async ({
+		id,
+		version,
+		customer,
+		vendor,
+		companyName,
+		taxNumber,
+		vatRegistrationId,
+		firstName,
+		lastName,
+		salutation,
+		note,
+	}) => {
+		if (!customer && !vendor) {
+			return {
+				content: [
+					{
+						type: 'text',
+						text: 'Error: Lexoffice requires at least one role. Set customer or vendor to "true".',
+					},
+				],
+			};
+		}
+		const result = await makeLexwareOfficeWriteRequest<any>(`/v1/contacts/${id}`, 'PUT', {
+			version,
+			roles: {
+				...(customer ? { customer: {} } : {}),
+				...(vendor ? { vendor: {} } : {}),
+			},
+			...(companyName
+				? {
+						company: {
+							name: companyName,
+							...(taxNumber ? { taxNumber } : {}),
+							...(vatRegistrationId ? { vatRegistrationId } : {}),
+						},
+					}
+				: {}),
+			...(lastName || firstName
+				? {
+						person: {
+							...(salutation ? { salutation } : {}),
+							...(firstName ? { firstName } : {}),
+							...(lastName ? { lastName } : {}),
+						},
+					}
+				: {}),
+			...(note ? { note } : {}),
+		});
+
+		if (!result || !result.ok) {
+			return {
+				content: [
+					{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+				],
+			};
+		}
+
+		return {
+			content: [
+				{
+					type: 'text',
+					text: `Contact updated successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
+				},
+			],
+		};
+	},
+);
+
+server.tool(
+	'create-article',
+	'Create a new article (Artikel/Produkt) in Lexware Office.',
+	{
+		type: z.enum(['PRODUCT', 'SERVICE']).describe('PRODUCT (Ware) or SERVICE (Dienstleistung)'),
+		title: z.string().describe('Article name/title'),
+		description: z.string().optional().describe('Article description'),
+		articleNumber: z.string().optional().describe('Article number (Artikelnummer)'),
+		unitName: z.string().optional().describe('Unit name, e.g. "Stunden", "Stück"'),
+		price: articlePriceSchema.optional().describe('Selling price'),
+	},
+	async ({ type, title, description, articleNumber, unitName, price }) => {
+		const body: Record<string, unknown> = { type, title };
+		if (description) body.description = description;
+		if (articleNumber) body.articleNumber = articleNumber;
+		if (unitName) body.unitName = unitName;
+		if (price) body.price = price;
+
+		const result = await makeLexwareOfficeWriteRequest<any>('/v1/articles', 'POST', body);
+
+		if (!result || !result.ok) {
+			return {
+				content: [
+					{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+				],
+			};
+		}
+
+		return {
+			content: [
+				{
+					type: 'text',
+					text: `Article created successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
+				},
+			],
+		};
+	},
+);
+
+server.tool(
+	'update-article',
+	'Update an existing article in Lexware Office. Requires the current version number for optimistic locking (get it from get-article-details).',
+	{
+		id: z.string().uuid().describe('The ID of the article to update'),
+		version: z.number().int().describe('Current version (for optimistic locking)'),
+		type: z.enum(['PRODUCT', 'SERVICE']),
+		title: z.string().describe('Article name/title'),
+		description: z.string().optional(),
+		articleNumber: z.string().optional(),
+		unitName: z.string().optional(),
+		price: articlePriceSchema.optional(),
+	},
+	async ({ id, version, type, title, description, articleNumber, unitName, price }) => {
+		const body: Record<string, unknown> = { version, type, title };
+		if (description) body.description = description;
+		if (articleNumber) body.articleNumber = articleNumber;
+		if (unitName) body.unitName = unitName;
+		if (price) body.price = price;
+
+		const result = await makeLexwareOfficeWriteRequest<any>(`/v1/articles/${id}`, 'PUT', body);
+
+		if (!result || !result.ok) {
+			return {
+				content: [
+					{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+				],
+			};
+		}
+
+		return {
+			content: [
+				{
+					type: 'text',
+					text: `Article updated successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
+				},
+			],
+		};
+	},
+);
+
+server.tool(
+	'create-voucher',
+	'Create a new bookkeeping voucher (Buchungsbeleg) in Lexware Office. Use list-posting-categories to find valid categoryId values.',
+	{
+		type: z
+			.enum(['purchaseinvoice', 'purchasecreditnote', 'salesinvoice', 'salescreditnote'])
+			.describe(
+				'purchaseinvoice (Eingangsrechnung), purchasecreditnote, salesinvoice, salescreditnote',
+			),
+		voucherDate: z.string().describe('Voucher date in ISO 8601 format'),
+		voucherNumber: z.string().optional().describe("Supplier's invoice number"),
+		dueDate: z.string().optional(),
+		contactId: z.string().uuid().optional(),
+		remark: z.string().optional().describe('Internal note'),
+		taxType: z.enum(['net', 'gross', 'vatfree']),
+		voucherItems: z
+			.array(
+				z.object({
+					amount: z.number().describe('Gross amount, e.g. 119.00'),
+					taxAmount: z.number().describe('Tax amount, e.g. 19.00'),
+					taxRatePercent: z.number().describe('Tax rate: 0, 7, or 19'),
+					categoryId: z.string().uuid().describe('Posting category ID from list-posting-categories'),
+				}),
+			)
+			.min(1),
+	},
+	async (params) => {
+		const totalGrossAmount = params.voucherItems.reduce((s, i) => s + i.amount, 0);
+		const totalTaxAmount = params.voucherItems.reduce((s, i) => s + i.taxAmount, 0);
+		const result = await makeLexwareOfficeWriteRequest<any>('/v1/vouchers', 'POST', {
+			...params,
+			totalGrossAmount,
+			totalTaxAmount,
+		});
+
+		if (!result || !result.ok) {
+			return {
+				content: [
+					{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+				],
+			};
+		}
+
+		return {
+			content: [
+				{
+					type: 'text',
+					text: `Voucher created successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
+				},
+			],
+		};
+	},
+);
+
+server.tool(
+	'update-voucher',
+	'Update an existing bookkeeping voucher. Requires the current version number for optimistic locking (from get-voucher-details).',
+	{
+		id: z.string().uuid().describe('The ID of the voucher to update'),
+		version: z.number().int().describe('Current version (for optimistic locking)'),
+		type: z.enum(['purchaseinvoice', 'purchasecreditnote', 'salesinvoice', 'salescreditnote']),
+		voucherDate: z.string(),
+		voucherNumber: z.string().optional(),
+		dueDate: z.string().optional(),
+		contactId: z.string().uuid().optional(),
+		remark: z.string().optional(),
+		taxType: z.enum(['net', 'gross', 'vatfree']),
+		voucherItems: z
+			.array(
+				z.object({
+					amount: z.number(),
+					taxAmount: z.number(),
+					taxRatePercent: z.number(),
+					categoryId: z.string().uuid(),
+				}),
+			)
+			.min(1),
+	},
+	async ({ id, ...body }) => {
+		const totalGrossAmount = body.voucherItems.reduce((s, i) => s + i.amount, 0);
+		const totalTaxAmount = body.voucherItems.reduce((s, i) => s + i.taxAmount, 0);
+		const result = await makeLexwareOfficeWriteRequest<any>(`/v1/vouchers/${id}`, 'PUT', {
+			...body,
+			totalGrossAmount,
+			totalTaxAmount,
+		});
+
+		if (!result || !result.ok) {
+			return {
+				content: [
+					{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+				],
+			};
+		}
+
+		return {
+			content: [
+				{
+					type: 'text',
+					text: `Voucher updated successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
+				},
+			],
+		};
+	},
+);
+
+server.tool(
+	'create-event-subscription',
+	'Create a webhook event subscription in Lexware Office.',
+	{
+		eventType: z
+			.enum([
+				'article.created',
+				'article.changed',
+				'article.deleted',
+				'contact.created',
+				'contact.changed',
+				'contact.deleted',
+				'credit-note.created',
+				'credit-note.changed',
+				'credit-note.deleted',
+				'credit-note.status.changed',
+				'delivery-note.created',
+				'delivery-note.changed',
+				'delivery-note.deleted',
+				'delivery-note.status.changed',
+				'down-payment-invoice.created',
+				'down-payment-invoice.changed',
+				'down-payment-invoice.deleted',
+				'down-payment-invoice.status.changed',
+				'dunning.created',
+				'dunning.changed',
+				'dunning.deleted',
+				'invoice.created',
+				'invoice.changed',
+				'invoice.deleted',
+				'invoice.status.changed',
+				'order-confirmation.created',
+				'order-confirmation.changed',
+				'order-confirmation.deleted',
+				'order-confirmation.status.changed',
+				'payment.changed',
+				'quotation.created',
+				'quotation.changed',
+				'quotation.deleted',
+				'quotation.status.changed',
+				'recurring-template.created',
+				'recurring-template.changed',
+				'recurring-template.deleted',
+				'voucher.created',
+				'voucher.changed',
+				'voucher.deleted',
+				'voucher.status.changed',
+			])
+			.describe('The event type to subscribe to'),
+		callbackUrl: z.string().url().describe('Webhook URL that will receive event notifications'),
+	},
+	async ({ eventType, callbackUrl }) => {
+		const result = await makeLexwareOfficeWriteRequest<any>('/v1/event-subscriptions', 'POST', {
+			eventType,
+			callbackUrl,
+		});
+
+		if (!result || !result.ok) {
+			return {
+				content: [
+					{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+				],
+			};
+		}
+
+		return {
+			content: [
+				{
+					type: 'text',
+					text: `Event subscription created successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
+				},
+			],
+		};
+	},
+);
+
+server.tool(
+	'upload-file',
+	'Upload a file (PDF, JPG, PNG, or XML) to Lexware Office for bookkeeping. Returns a file ID. Max 5 MB.',
+	{
+		fileContentBase64: z.string().describe('Base64-encoded file content'),
+		fileName: z.string().describe('File name including extension, e.g. "rechnung.pdf"'),
+		mimeType: z
+			.enum(['application/pdf', 'image/jpeg', 'image/png', 'application/xml'])
+			.describe('MIME type of the file'),
+	},
+	async ({ fileContentBase64, fileName, mimeType }) => {
+		const fileBuffer = Buffer.from(fileContentBase64, 'base64');
+		const blob = new Blob([fileBuffer], { type: mimeType });
+		const formData = new FormData();
+		formData.append('file', blob, fileName);
+		formData.append('type', 'voucher');
+
+		const result = await makeLexwareOfficeMultipartRequest<any>('/v1/files', formData);
+
+		if (!result || !result.ok) {
+			return {
+				content: [
+					{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+				],
+			};
+		}
+
+		return {
+			content: [
+				{
+					type: 'text',
+					text: `File uploaded successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
+				},
+			],
+		};
+	},
+);
+
+server.tool(
+	'upload-file-to-voucher',
+	'Upload and assign a file directly to an existing voucher (Beleg) in Lexware Office.',
+	{
+		voucherId: z.string().uuid().describe('The ID of the voucher to attach the file to'),
+		fileContentBase64: z.string().describe('Base64-encoded file content'),
+		fileName: z.string().describe('File name including extension'),
+		mimeType: z
+			.enum(['application/pdf', 'image/jpeg', 'image/png', 'application/xml'])
+			.describe('MIME type of the file'),
+	},
+	async ({ voucherId, fileContentBase64, fileName, mimeType }) => {
+		const fileBuffer = Buffer.from(fileContentBase64, 'base64');
+		const blob = new Blob([fileBuffer], { type: mimeType });
+		const formData = new FormData();
+		formData.append('file', blob, fileName);
+
+		const result = await makeLexwareOfficeMultipartRequest<any>(
+			`/v1/vouchers/${voucherId}/files`,
+			formData,
+		);
+
+		if (!result || !result.ok) {
+			return {
+				content: [
+					{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+				],
+			};
+		}
+
+		return {
+			content: [
+				{
+					type: 'text',
+					text: `File uploaded to voucher ${voucherId} successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
+				},
+			],
+		};
+	},
+);
+
+// ─── Invoice: Create + Update ─────────────────────────────────────────────────
+
+server.tool(
+	'create-invoice',
+	`Creates a draft invoice in Lexware Office. ${finalizeHint(governance.permissions.finalize.invoices)} ${draftHint()}`,
+	invoiceSchema,
+	async (params) => {
+		const result = await makeLexwareOfficeWriteRequest<any>('/v1/invoices', 'POST', {
+			...params,
+			totalPrice: { currency: 'EUR' },
+		});
+
+		if (!result || !result.ok) {
+			return {
+				content: [
+					{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+				],
+			};
+		}
+
+		auditAllow('create-invoice', { id: (result.data as any)?.id ?? 'unknown' });
+		return {
+			content: [
+				{
+					type: 'text',
+					text: `Invoice created as draft successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
+				},
+			],
+		};
+	},
+);
+
+server.tool(
+	'update-invoice',
+	`Update a draft invoice in Lexware Office. Use this instead of creating a new draft — creating a new draft would leave gaps in sequential numbering. Only works on drafts (voucherStatus: "draft"). Requires the current version from get-invoice-details.`,
+	updateDocSchema,
+	async ({ id, version, ...rest }) => {
+		const result = await makeLexwareOfficeWriteRequest<any>(`/v1/invoices/${id}`, 'PUT', {
+			version,
+			...rest,
+			totalPrice: { currency: 'EUR' },
+		});
+
+		if (!result || !result.ok) {
+			return {
+				content: [
+					{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+				],
+			};
+		}
+
+		auditAllow('update-invoice', { id });
+		return {
+			content: [
+				{
+					type: 'text',
+					text: `Invoice draft updated successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
+				},
+			],
+		};
+	},
+);
+
+// ─── Quotation: Create + Update ───────────────────────────────────────────────
+
+const quotationCreateSchema = {
+	...invoiceSchema,
+	expirationDate: z
+		.string()
+		.optional()
+		.describe('Expiration date in ISO 8601 format, e.g. "2026-05-22T00:00:00.000+01:00"'),
+};
+
+const quotationUpdateSchema = {
+	id: z.string().uuid().describe('ID of the draft to update'),
+	version: z.number().int().describe('Current version for optimistic locking'),
+	...quotationCreateSchema,
+};
+
+server.tool(
+	'create-quotation',
+	`Create a new quotation (Angebot) as a draft in Lexware Office. ${finalizeHint(governance.permissions.finalize.quotations)} ${draftHint()}`,
+	quotationCreateSchema,
+	async (params) => {
+		const result = await makeLexwareOfficeWriteRequest<any>('/v1/quotations', 'POST', {
+			...params,
+			totalPrice: { currency: 'EUR' },
+		});
+
+		if (!result || !result.ok) {
+			return {
+				content: [
+					{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+				],
+			};
+		}
+
+		auditAllow('create-quotation', { id: (result.data as any)?.id ?? 'unknown' });
+		return {
+			content: [
+				{
+					type: 'text',
+					text: `Quotation created as draft successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
+				},
+			],
+		};
+	},
+);
+
+server.tool(
+	'update-quotation',
+	`Update a draft quotation (Angebot) in Lexware Office. Use this instead of creating a new draft to avoid gaps in sequential numbering. Only works on drafts. Requires current version from get-quotation-details.`,
+	quotationUpdateSchema,
+	async ({ id, version, ...rest }) => {
+		const result = await makeLexwareOfficeWriteRequest<any>(`/v1/quotations/${id}`, 'PUT', {
+			version,
+			...rest,
+			totalPrice: { currency: 'EUR' },
+		});
+
+		if (!result || !result.ok) {
+			return {
+				content: [
+					{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+				],
+			};
+		}
+
+		auditAllow('update-quotation', { id });
+		return {
+			content: [
+				{
+					type: 'text',
+					text: `Quotation draft updated successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
+				},
+			],
+		};
+	},
+);
+
+// ─── Credit Note: Create + Update ─────────────────────────────────────────────
+
+const creditNoteCreateSchema = {
+	...invoiceSchema,
+	precedingSalesVoucherId: z
+		.string()
+		.uuid()
+		.optional()
+		.describe('ID of the original invoice this credit note refers to (optional)'),
+};
+
+const creditNoteUpdateSchema = {
+	id: z.string().uuid().describe('ID of the draft to update'),
+	version: z.number().int().describe('Current version for optimistic locking'),
+	...creditNoteCreateSchema,
+};
+
+server.tool(
+	'create-credit-note',
+	`Create a new credit note (Gutschrift) as a draft in Lexware Office. ${finalizeHint(governance.permissions.finalize.creditNotes)} ${draftHint()}`,
+	creditNoteCreateSchema,
+	async (params) => {
+		const result = await makeLexwareOfficeWriteRequest<any>('/v1/credit-notes', 'POST', {
+			...params,
+			totalPrice: { currency: 'EUR' },
+		});
+
+		if (!result || !result.ok) {
+			return {
+				content: [
+					{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+				],
+			};
+		}
+
+		auditAllow('create-credit-note', { id: (result.data as any)?.id ?? 'unknown' });
+		return {
+			content: [
+				{
+					type: 'text',
+					text: `Credit note created as draft successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
+				},
+			],
+		};
+	},
+);
+
+server.tool(
+	'update-credit-note',
+	`Update a draft credit note (Gutschrift) in Lexware Office. Use this instead of creating a new draft to avoid gaps in sequential numbering. Only works on drafts. Requires current version from get-credit-note-details.`,
+	creditNoteUpdateSchema,
+	async ({ id, version, ...rest }) => {
+		const result = await makeLexwareOfficeWriteRequest<any>(`/v1/credit-notes/${id}`, 'PUT', {
+			version,
+			...rest,
+			totalPrice: { currency: 'EUR' },
+		});
+
+		if (!result || !result.ok) {
+			return {
+				content: [
+					{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+				],
+			};
+		}
+
+		auditAllow('update-credit-note', { id });
+		return {
+			content: [
+				{
+					type: 'text',
+					text: `Credit note draft updated successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
+				},
+			],
+		};
+	},
+);
+
+// ─── Order Confirmation: Create + Update ──────────────────────────────────────
+
+server.tool(
+	'create-order-confirmation',
+	`Create a new order confirmation (Auftragsbestätigung) as a draft in Lexware Office. ${finalizeHint(governance.permissions.finalize.orderConfirmations)} ${draftHint()}`,
+	invoiceSchema,
+	async (params) => {
+		const result = await makeLexwareOfficeWriteRequest<any>('/v1/order-confirmations', 'POST', {
+			...params,
+			totalPrice: { currency: 'EUR' },
+		});
+
+		if (!result || !result.ok) {
+			return {
+				content: [
+					{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+				],
+			};
+		}
+
+		auditAllow('create-order-confirmation', { id: (result.data as any)?.id ?? 'unknown' });
+		return {
+			content: [
+				{
+					type: 'text',
+					text: `Order confirmation created as draft successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
+				},
+			],
+		};
+	},
+);
+
+server.tool(
+	'update-order-confirmation',
+	`Update a draft order confirmation (Auftragsbestätigung) in Lexware Office. Use this instead of creating a new draft to avoid gaps in sequential numbering. Only works on drafts. Requires current version from get-order-confirmation-details.`,
+	updateDocSchema,
+	async ({ id, version, ...rest }) => {
+		const result = await makeLexwareOfficeWriteRequest<any>(
+			`/v1/order-confirmations/${id}`,
+			'PUT',
+			{
+				version,
+				...rest,
+				totalPrice: { currency: 'EUR' },
+			},
+		);
+
+		if (!result || !result.ok) {
+			return {
+				content: [
+					{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+				],
+			};
+		}
+
+		auditAllow('update-order-confirmation', { id });
+		return {
+			content: [
+				{
+					type: 'text',
+					text: `Order confirmation draft updated successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
+				},
+			],
+		};
+	},
+);
+
+// ─── Delivery Note: Create + Update ──────────────────────────────────────────
+
+const deliveryNoteLineItemSchema = z.discriminatedUnion('type', [
+	z.object({
+		type: z.enum(['material', 'service', 'custom']),
+		name: z.string().describe('Line item title shown in bold on the PDF. Keep short — 1 line max.'),
+		description: z
+			.string()
+			.optional()
+			.describe('Optional multi-line description shown below the title.'),
+		quantity: z.number().describe('Quantity'),
+		unitName: z.string().describe('Unit name, e.g. "Stück", "kg"'),
+	}),
+	z.object({
+		type: z.literal('text'),
+		name: z.string().describe('Free text line'),
+	}),
+]);
+
+const deliveryNoteBaseSchema = {
+	voucherDate: z
+		.string()
+		.describe('Delivery note date in ISO 8601 format, e.g. "2026-03-22T00:00:00.000+01:00"'),
+	address: invoiceAddressSchema,
+	lineItems: z.array(deliveryNoteLineItemSchema).min(1),
+	taxConditions: z
+		.object({
+			taxType: z.enum(['net', 'gross', 'vatfree']),
+		})
+		.describe('Required by Lexoffice API even for delivery notes'),
+	shippingConditions: z
+		.object({
+			shippingDate: z.string().describe('Delivery date in ISO 8601 format'),
+			shippingEndDate: z.string().optional(),
+			shippingType: z.enum(['service', 'delivery', 'serviceperiod', 'deliveryperiod']),
+		})
+		.describe('Required by Lexoffice API'),
+	introduction: z.string().optional(),
+	remark: z.string().optional(),
+};
+
+server.tool(
+	'create-delivery-note',
+	`Create a new delivery note (Lieferschein) as a draft in Lexware Office. ${finalizeHint(governance.permissions.finalize.deliveryNotes)} ${draftHint()}`,
+	deliveryNoteBaseSchema,
+	async (params) => {
+		const result = await makeLexwareOfficeWriteRequest<any>('/v1/delivery-notes', 'POST', params);
+
+		if (!result || !result.ok) {
+			return {
+				content: [
+					{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+				],
+			};
+		}
+
+		auditAllow('create-delivery-note', { id: (result.data as any)?.id ?? 'unknown' });
+		return {
+			content: [
+				{
+					type: 'text',
+					text: `Delivery note created as draft successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
+				},
+			],
+		};
+	},
+);
+
+server.tool(
+	'update-delivery-note',
+	`Update a draft delivery note (Lieferschein) in Lexware Office. Use this instead of creating a new draft to avoid gaps in sequential numbering. Only works on drafts. Requires current version from get-delivery-note-details.`,
+	{
+		id: z.string().uuid().describe('ID of the draft to update'),
+		version: z.number().int().describe('Current version for optimistic locking'),
+		...deliveryNoteBaseSchema,
+	},
+	async ({ id, version, ...rest }) => {
+		const result = await makeLexwareOfficeWriteRequest<any>(`/v1/delivery-notes/${id}`, 'PUT', {
+			version,
+			...rest,
+		});
+
+		if (!result || !result.ok) {
+			return {
+				content: [
+					{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+				],
+			};
+		}
+
+		auditAllow('update-delivery-note', { id });
+		return {
+			content: [
+				{
+					type: 'text',
+					text: `Delivery note draft updated successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
+				},
+			],
+		};
+	},
+);
+
+// ─── Dunning: Create ──────────────────────────────────────────────────────────
+
+const dunningSchema = {
+	precedingSalesVoucherId: z
+		.string()
+		.uuid()
+		.describe('ID of the invoice this dunning is for (from get-invoices or get-invoice-details)'),
+	voucherDate: z.string().describe('Dunning date in ISO 8601 format'),
+	address: invoiceAddressSchema,
+	lineItems: z.array(lineItemSchema).min(1),
+	taxConditions: z.object({ taxType: z.enum(['net', 'gross', 'vatfree']) }),
+	shippingConditions: z
+		.object({
+			shippingDate: z.string(),
+			shippingEndDate: z.string().optional(),
+			shippingType: z.enum(['service', 'delivery', 'serviceperiod', 'deliveryperiod']),
+		})
+		.describe('Required by Lexoffice API'),
+	introduction: z.string().optional(),
+	remark: z.string().optional(),
+};
+
+server.tool(
+	'create-dunning',
+	`Create a dunning notice (Mahnung) as a draft in Lexware Office for an existing invoice. ${finalizeHint(governance.permissions.finalize.dunnings)} Note: the API always returns voucherStatus "draft" for dunnings — this is expected API behaviour.`,
+	dunningSchema,
+	async (params) => {
+		const { precedingSalesVoucherId, ...rest } = params;
+		const path = `/v1/dunnings?precedingSalesVoucherId=${encodeURIComponent(precedingSalesVoucherId)}`;
+		const result = await makeLexwareOfficeWriteRequest<any>(path, 'POST', {
+			...rest,
+			totalPrice: { currency: 'EUR' },
+		});
+
+		if (!result || !result.ok) {
+			return {
+				content: [
+					{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+				],
+			};
+		}
+
+		auditAllow('create-dunning', { id: (result.data as any)?.id ?? 'unknown' });
+		return {
+			content: [
+				{
+					type: 'text',
+					text: `Dunning created as draft successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
+				},
+			],
+		};
+	},
+);
+
+// ─── Archive Tools (always available when governance allows) ──────────────────
+
+if (governance.permissions.archive.contacts) {
+	server.tool(
+		'archive-contact',
+		'Archive a contact (soft-delete). The contact remains in Lexware but is hidden from standard lists and cannot be used in new documents. Existing references in old invoices remain intact. Use this instead of hard deletion — it is reversible.',
+		{
+			id: z.string().uuid().describe('The ID of the contact to archive'),
+		},
+		async ({ id }) => {
+			// Fetch current state to get version and existing fields
+			const current = await makeLexwareOfficeRequest<any>(`/v1/contacts/${id}`);
+			if (!current) {
+				return { content: [{ type: 'text', text: 'Failed to retrieve contact data' }] };
+			}
+
+			const result = await makeLexwareOfficeWriteRequest<any>(`/v1/contacts/${id}`, 'PUT', {
+				...current,
+				archived: true,
+			});
+
+			if (!result || !result.ok) {
+				return {
+					content: [
+						{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+					],
+				};
+			}
+
+			auditAllow('archive-contact', { id });
+			return {
+				content: [{ type: 'text', text: `Contact ${id} archived successfully.` }],
+			};
+		},
+	);
+
+	server.tool(
+		'unarchive-contact',
+		'Restore an archived contact in Lexware Office. After unarchiving, the contact will appear in standard lists and can be used in new documents again.',
+		{
+			id: z.string().uuid().describe('The ID of the contact to unarchive'),
+		},
+		async ({ id }) => {
+			const current = await makeLexwareOfficeRequest<any>(`/v1/contacts/${id}`);
+			if (!current) {
+				return { content: [{ type: 'text', text: 'Failed to retrieve contact data' }] };
+			}
+
+			const result = await makeLexwareOfficeWriteRequest<any>(`/v1/contacts/${id}`, 'PUT', {
+				...current,
+				archived: false,
+			});
+
+			if (!result || !result.ok) {
+				return {
+					content: [
+						{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+					],
+				};
+			}
+
+			auditAllow('unarchive-contact', { id });
+			return {
+				content: [{ type: 'text', text: `Contact ${id} unarchived successfully.` }],
+			};
+		},
+	);
+}
+
+if (governance.permissions.archive.articles) {
+	server.tool(
+		'archive-article',
+		'Archive an article (soft-delete). The article remains in Lexware but is hidden from standard lists and cannot be used in new documents. Existing references in old invoices remain intact. Use this instead of hard deletion — it is reversible.',
+		{
+			id: z.string().uuid().describe('The ID of the article to archive'),
+		},
+		async ({ id }) => {
+			const current = await makeLexwareOfficeRequest<any>(`/v1/articles/${id}`);
+			if (!current) {
+				return { content: [{ type: 'text', text: 'Failed to retrieve article data' }] };
+			}
+
+			const result = await makeLexwareOfficeWriteRequest<any>(`/v1/articles/${id}`, 'PUT', {
+				...current,
+				archived: true,
+			});
+
+			if (!result || !result.ok) {
+				return {
+					content: [
+						{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+					],
+				};
+			}
+
+			auditAllow('archive-article', { id });
+			return {
+				content: [{ type: 'text', text: `Article ${id} archived successfully.` }],
+			};
+		},
+	);
+
+	server.tool(
+		'unarchive-article',
+		'Restore an archived article in Lexware Office. After unarchiving, the article will appear in standard lists and can be used in new documents again.',
+		{
+			id: z.string().uuid().describe('The ID of the article to unarchive'),
+		},
+		async ({ id }) => {
+			const current = await makeLexwareOfficeRequest<any>(`/v1/articles/${id}`);
+			if (!current) {
+				return { content: [{ type: 'text', text: 'Failed to retrieve article data' }] };
+			}
+
+			const result = await makeLexwareOfficeWriteRequest<any>(`/v1/articles/${id}`, 'PUT', {
+				...current,
+				archived: false,
+			});
+
+			if (!result || !result.ok) {
+				return {
+					content: [
+						{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+					],
+				};
+			}
+
+			auditAllow('unarchive-article', { id });
+			return {
+				content: [{ type: 'text', text: `Article ${id} unarchived successfully.` }],
+			};
+		},
+	);
+}
+
+// ─── Governance-Gated: Finalize Tools ─────────────────────────────────────────
+
+if (governance.permissions.finalize.invoices) {
+	server.tool(
+		'finalize-invoice',
+		'Create and immediately finalize (publish) an invoice in Lexware Office. The invoice will be locked and cannot be edited. Use create-invoice to create a draft first.',
+		invoiceSchema,
+		async (params) => {
+			const result = await makeLexwareOfficeWriteRequest<any>(
+				'/v1/invoices?finalize=true',
+				'POST',
+				{ ...params, totalPrice: { currency: 'EUR' } },
+			);
+
+			if (!result || !result.ok) {
+				return {
+					content: [
+						{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+					],
+				};
+			}
+
+			auditAllow('finalize-invoice', { id: (result.data as any)?.id ?? 'unknown' });
+			return {
+				content: [
+					{
+						type: 'text',
+						text: `Invoice created and finalized successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
+					},
+				],
+			};
+		},
+	);
+}
+
+if (governance.permissions.finalize.quotations) {
+	server.tool(
+		'finalize-quotation',
+		'Create and immediately finalize (publish) a quotation (Angebot) in Lexware Office. The quotation will be locked and cannot be edited.',
+		quotationCreateSchema,
+		async (params) => {
+			const result = await makeLexwareOfficeWriteRequest<any>(
+				'/v1/quotations?finalize=true',
+				'POST',
+				{ ...params, totalPrice: { currency: 'EUR' } },
+			);
+
+			if (!result || !result.ok) {
+				return {
+					content: [
+						{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+					],
+				};
+			}
+
+			auditAllow('finalize-quotation', { id: (result.data as any)?.id ?? 'unknown' });
+			return {
+				content: [
+					{
+						type: 'text',
+						text: `Quotation created and finalized successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
+					},
+				],
+			};
+		},
+	);
+}
+
+if (governance.permissions.finalize.creditNotes) {
+	server.tool(
+		'finalize-credit-note',
+		'Create and immediately finalize a credit note (Gutschrift) in Lexware Office. The credit note will be locked and cannot be edited.',
+		creditNoteCreateSchema,
+		async (params) => {
+			const result = await makeLexwareOfficeWriteRequest<any>(
+				'/v1/credit-notes?finalize=true',
+				'POST',
+				{ ...params, totalPrice: { currency: 'EUR' } },
+			);
+
+			if (!result || !result.ok) {
+				return {
+					content: [
+						{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+					],
+				};
+			}
+
+			auditAllow('finalize-credit-note', { id: (result.data as any)?.id ?? 'unknown' });
+			return {
+				content: [
+					{
+						type: 'text',
+						text: `Credit note created and finalized successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
+					},
+				],
+			};
+		},
+	);
+}
+
+if (governance.permissions.finalize.orderConfirmations) {
+	server.tool(
+		'finalize-order-confirmation',
+		'Create and immediately finalize an order confirmation (Auftragsbestätigung) in Lexware Office. The document will be locked and cannot be edited.',
+		invoiceSchema,
+		async (params) => {
+			const result = await makeLexwareOfficeWriteRequest<any>(
+				'/v1/order-confirmations?finalize=true',
+				'POST',
+				{ ...params, totalPrice: { currency: 'EUR' } },
+			);
+
+			if (!result || !result.ok) {
+				return {
+					content: [
+						{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+					],
+				};
+			}
+
+			auditAllow('finalize-order-confirmation', { id: (result.data as any)?.id ?? 'unknown' });
+			return {
+				content: [
+					{
+						type: 'text',
+						text: `Order confirmation created and finalized successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
+					},
+				],
+			};
+		},
+	);
+}
+
+if (governance.permissions.finalize.deliveryNotes) {
+	server.tool(
+		'finalize-delivery-note',
+		'Create and immediately finalize a delivery note (Lieferschein) in Lexware Office. The document will be locked and cannot be edited.',
+		deliveryNoteBaseSchema,
+		async (params) => {
+			const result = await makeLexwareOfficeWriteRequest<any>(
+				'/v1/delivery-notes?finalize=true',
+				'POST',
+				params,
+			);
+
+			if (!result || !result.ok) {
+				return {
+					content: [
+						{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+					],
+				};
+			}
+
+			auditAllow('finalize-delivery-note', { id: (result.data as any)?.id ?? 'unknown' });
+			return {
+				content: [
+					{
+						type: 'text',
+						text: `Delivery note created and finalized successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
+					},
+				],
+			};
+		},
+	);
+}
+
+if (governance.permissions.finalize.dunnings) {
+	server.tool(
+		'finalize-dunning',
+		'Create and immediately finalize a dunning notice (Mahnung) in Lexware Office. Note: the API always returns voucherStatus "draft" for dunnings — this is expected API behaviour.',
+		dunningSchema,
+		async (params) => {
+			const { precedingSalesVoucherId, ...rest } = params;
+			const path = `/v1/dunnings?precedingSalesVoucherId=${encodeURIComponent(precedingSalesVoucherId)}&finalize=true`;
+			const result = await makeLexwareOfficeWriteRequest<any>(path, 'POST', {
+				...rest,
+				totalPrice: { currency: 'EUR' },
+			});
+
+			if (!result || !result.ok) {
+				return {
+					content: [
+						{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+					],
+				};
+			}
+
+			auditAllow('finalize-dunning', { id: (result.data as any)?.id ?? 'unknown' });
+			return {
+				content: [
+					{
+						type: 'text',
+						text: `Dunning created and finalized successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
+					},
+				],
+			};
+		},
+	);
+}
+
+// ─── Governance-Gated: Delete Tools ──────────────────────────────────────────
+
+if (governance.permissions.delete.articles) {
+	server.tool(
+		'delete-article',
+		'Permanently delete an article from Lexware Office. This action is IRREVERSIBLE. Consider using archive-article instead — it is reversible and preserves references in existing documents.',
+		{
+			id: z.string().uuid().describe('The ID of the article to delete'),
+		},
+		async ({ id }) => {
+			const result = await makeLexwareOfficeWriteRequest<any>(`/v1/articles/${id}`, 'DELETE');
+
+			if (!result || !result.ok) {
+				return {
+					content: [
+						{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+					],
+				};
+			}
+
+			auditAllow('delete-article', { id });
+			return {
+				content: [{ type: 'text', text: `Article ${id} deleted successfully.` }],
+			};
+		},
+	);
+}
+
+if (governance.permissions.delete.contacts) {
+	server.tool(
+		'delete-contact',
+		'Permanently delete a contact from Lexware Office. This action is IRREVERSIBLE. Consider using archive-contact instead — it is reversible and preserves references in existing documents.',
+		{
+			id: z.string().uuid().describe('The ID of the contact to delete'),
+		},
+		async ({ id }) => {
+			const result = await makeLexwareOfficeWriteRequest<any>(`/v1/contacts/${id}`, 'DELETE');
+
+			if (!result || !result.ok) {
+				return {
+					content: [
+						{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+					],
+				};
+			}
+
+			auditAllow('delete-contact', { id });
+			return {
+				content: [{ type: 'text', text: `Contact ${id} deleted successfully.` }],
+			};
+		},
+	);
+}
+
+if (governance.permissions.delete.vouchers) {
+	server.tool(
+		'delete-voucher',
+		'Permanently delete a bookkeeping voucher from Lexware Office. This action is IRREVERSIBLE.',
+		{
+			id: z.string().uuid().describe('The ID of the voucher to delete'),
+		},
+		async ({ id }) => {
+			const result = await makeLexwareOfficeWriteRequest<any>(`/v1/vouchers/${id}`, 'DELETE');
+
+			if (!result || !result.ok) {
+				return {
+					content: [
+						{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+					],
+				};
+			}
+
+			auditAllow('delete-voucher', { id });
+			return {
+				content: [{ type: 'text', text: `Voucher ${id} deleted successfully.` }],
+			};
+		},
+	);
+}
+
+// Draft-numbered document deletions — require explicit opt-in even in unrestricted mode
+
+if (governance.permissions.delete.invoiceDrafts) {
+	server.tool(
+		'delete-invoice-draft',
+		'⚠️ Delete a draft invoice. WARNING: Even though the invoice is a draft, its sequential number has already been reserved. Deletion creates a permanent gap in the invoice numbering, which may violate bookkeeping regulations. Only proceed if you are certain this is acceptable.',
+		{
+			id: z.string().uuid().describe('The ID of the invoice draft to delete'),
+		},
+		async ({ id }) => {
+			const result = await makeLexwareOfficeWriteRequest<any>(`/v1/invoices/${id}`, 'DELETE');
+
+			if (!result || !result.ok) {
+				return {
+					content: [
+						{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+					],
+				};
+			}
+
+			auditAllow('delete-invoice-draft', { id });
+			return {
+				content: [{ type: 'text', text: `Invoice draft ${id} deleted. Sequential number gap created.` }],
+			};
+		},
+	);
+}
+
+if (governance.permissions.delete.quotationDrafts) {
+	server.tool(
+		'delete-quotation-draft',
+		'⚠️ Delete a draft quotation. WARNING: Deletion creates a permanent gap in quotation numbering. Only proceed if you are certain this is acceptable.',
+		{
+			id: z.string().uuid().describe('The ID of the quotation draft to delete'),
+		},
+		async ({ id }) => {
+			const result = await makeLexwareOfficeWriteRequest<any>(`/v1/quotations/${id}`, 'DELETE');
+
+			if (!result || !result.ok) {
+				return {
+					content: [
+						{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+					],
+				};
+			}
+
+			auditAllow('delete-quotation-draft', { id });
+			return {
+				content: [{ type: 'text', text: `Quotation draft ${id} deleted. Sequential number gap created.` }],
+			};
+		},
+	);
+}
+
+if (governance.permissions.delete.creditNoteDrafts) {
+	server.tool(
+		'delete-credit-note-draft',
+		'⚠️ Delete a draft credit note. WARNING: Deletion creates a permanent gap in credit note numbering.',
+		{
+			id: z.string().uuid().describe('The ID of the credit note draft to delete'),
+		},
+		async ({ id }) => {
+			const result = await makeLexwareOfficeWriteRequest<any>(`/v1/credit-notes/${id}`, 'DELETE');
+
+			if (!result || !result.ok) {
+				return {
+					content: [
+						{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+					],
+				};
+			}
+
+			auditAllow('delete-credit-note-draft', { id });
+			return {
+				content: [{ type: 'text', text: `Credit note draft ${id} deleted. Sequential number gap created.` }],
+			};
+		},
+	);
+}
+
+if (governance.permissions.delete.orderConfirmationDrafts) {
+	server.tool(
+		'delete-order-confirmation-draft',
+		'⚠️ Delete a draft order confirmation. WARNING: Deletion creates a permanent gap in order confirmation numbering.',
+		{
+			id: z.string().uuid().describe('The ID of the order confirmation draft to delete'),
+		},
+		async ({ id }) => {
+			const result = await makeLexwareOfficeWriteRequest<any>(
+				`/v1/order-confirmations/${id}`,
+				'DELETE',
+			);
+
+			if (!result || !result.ok) {
+				return {
+					content: [
+						{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+					],
+				};
+			}
+
+			auditAllow('delete-order-confirmation-draft', { id });
+			return {
+				content: [{ type: 'text', text: `Order confirmation draft ${id} deleted. Sequential number gap created.` }],
+			};
+		},
+	);
+}
+
+if (governance.permissions.delete.deliveryNoteDrafts) {
+	server.tool(
+		'delete-delivery-note-draft',
+		'⚠️ Delete a draft delivery note. WARNING: Deletion creates a permanent gap in delivery note numbering.',
+		{
+			id: z.string().uuid().describe('The ID of the delivery note draft to delete'),
+		},
+		async ({ id }) => {
+			const result = await makeLexwareOfficeWriteRequest<any>(
+				`/v1/delivery-notes/${id}`,
+				'DELETE',
+			);
+
+			if (!result || !result.ok) {
+				return {
+					content: [
+						{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+					],
+				};
+			}
+
+			auditAllow('delete-delivery-note-draft', { id });
+			return {
+				content: [{ type: 'text', text: `Delivery note draft ${id} deleted. Sequential number gap created.` }],
+			};
+		},
+	);
+}
+
+if (governance.permissions.delete.eventSubscriptions) {
+	server.tool(
+		'delete-event-subscription',
+		'Delete a webhook event subscription from Lexware Office by its ID.',
+		{
+			id: z.string().uuid().describe('The ID of the event subscription to delete'),
+		},
+		async ({ id }) => {
+			const result = await makeLexwareOfficeWriteRequest<void>(
+				`/v1/event-subscriptions/${id}`,
+				'DELETE',
+			);
+
+			if (!result || !result.ok) {
+				return {
+					content: [
+						{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) },
+					],
+				};
+			}
+
+			auditAllow('delete-event-subscription', { id });
+			return {
+				content: [{ type: 'text', text: `Event subscription ${id} deleted successfully.` }],
+			};
+		},
+	);
+}
+
+// ─── Main ─────────────────────────────────────────────────────────────────────
+
+async function main() {
+	const transport = new StdioServerTransport();
+	await server.connect(transport);
+	logger.log('Lexware Office MCP Server running', {
+		safetyMode: governance.safetyMode,
+		permissions: governance.permissions,
+	});
+}
+
+main().catch((error) => {
+	logger.error('Fatal error in main():', { error });
+	process.exit(1);
+});

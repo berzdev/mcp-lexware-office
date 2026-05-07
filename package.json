@@ -1,0 +1,38 @@
+{
+  "name": "mcp-lexware-office",
+  "description": "MCP server to interact with Lexware Office — with governance & safety controls",
+  "version": "2.0.0",
+  "license": "MIT",
+  "author": "Jannik Wempe <jannik@wempe.dev>",
+  "contributors": [
+    "Simon Fieber <https://github.com/si0nDE>",
+    "Paul Berz <https://github.com/berzdev>"
+  ],
+  "keywords": [
+    "mcp",
+    "lexware-office",
+    "lexoffice",
+    "governance"
+  ],
+  "homepage": "https://github.com/berzdev/mcp-lexware-office",
+  "bugs": "https://github.com/berzdev/mcp-lexware-office/issues",
+  "type": "module",
+  "bin": {
+    "lexware-office": "./build/index.js"
+  },
+  "files": [
+    "build"
+  ],
+  "scripts": {
+    "build": "tsc && shx chmod +x build/*.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.7.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "shx": "^0.3.4",
+    "typescript": "^5.8.2"
+  }
+}
