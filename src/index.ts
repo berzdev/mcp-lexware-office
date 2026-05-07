@@ -98,21 +98,39 @@ const invoiceAddressSchema = z.union([
 const DATE_FORMAT_HINT =
 	'ISO 8601 datetime with timezone offset. Use midnight for the time component and the current German timezone: "+01:00" (CET, Nov–Mar) or "+02:00" (CEST, Apr–Oct). Example for 22 March 2026: "2026-03-22T00:00:00.000+01:00"';
 
+const SHIPPING_TYPE_HINT = `What appears on the PDF and when to use each type:
+
+• "service" → "Leistungsdatum: 22.03.2026"
+  Use for: a service performed on a single day (consulting session, repair, one-time work).
+  Requires: shippingDate only.
+
+• "serviceperiod" → "Leistungszeitraum: 01.03.2026–31.03.2026"
+  Use for: a service performed over multiple days or a full month (monthly retainer, project phase, subscription period).
+  Requires: shippingDate (start) AND shippingEndDate (end, inclusive).
+
+• "delivery" → "Lieferdatum: 22.03.2026"
+  Use for: physical goods delivered on a single day.
+  Requires: shippingDate only.
+
+• "deliveryperiod" → "Lieferzeitraum: 01.03.2026–31.03.2026"
+  Use for: physical goods delivered in batches over a period.
+  Requires: shippingDate (start) AND shippingEndDate (end, inclusive).
+
+Rule of thumb: services → "service"/"serviceperiod"; physical goods → "delivery"/"deliveryperiod"; single date → no "period"; date range → "period" variant.`;
+
 const shippingConditionsSchema = z.object({
 	shippingDate: z
 		.string()
-		.describe(`Start date of the service or delivery period. Format: ${DATE_FORMAT_HINT}`),
+		.describe(`Date of service/delivery, or start of the period if using a period type. Format: ${DATE_FORMAT_HINT}`),
 	shippingEndDate: z
 		.string()
 		.optional()
 		.describe(
-			'End date — REQUIRED when shippingType is "serviceperiod" or "deliveryperiod". Must be on or after shippingDate. Omit for single-date types ("service", "delivery"). Format: same as shippingDate.',
+			'End date of the period — REQUIRED when shippingType is "serviceperiod" or "deliveryperiod". Must be on or after shippingDate. OMIT for single-date types ("service", "delivery"). Format: same as shippingDate.',
 		),
 	shippingType: z
 		.enum(['service', 'delivery', 'serviceperiod', 'deliveryperiod'])
-		.describe(
-			'"service" = single Leistungsdatum (most common for services), "delivery" = single Lieferdatum, "serviceperiod" = Leistungszeitraum (range, requires shippingEndDate), "deliveryperiod" = Lieferzeitraum (range, requires shippingEndDate)',
-		),
+		.describe(SHIPPING_TYPE_HINT),
 });
 
 const paymentConditionsSchema = z
@@ -1848,14 +1866,14 @@ const deliveryNoteBaseSchema = {
 		.describe('Required by Lexoffice API even for delivery notes'),
 	shippingConditions: z
 		.object({
-			shippingDate: z.string().describe(`Delivery date or period start. Format: ${DATE_FORMAT_HINT}`),
+			shippingDate: z.string().describe(`Delivery date, or period start for period types. Format: ${DATE_FORMAT_HINT}`),
 			shippingEndDate: z
 				.string()
 				.optional()
-				.describe('Period end date — REQUIRED for "deliveryperiod" type. Format: same as shippingDate.'),
+				.describe('REQUIRED for "deliveryperiod". OMIT for "delivery". Format: same as shippingDate.'),
 			shippingType: z
 				.enum(['service', 'delivery', 'serviceperiod', 'deliveryperiod'])
-				.describe('"delivery" = single Lieferdatum, "deliveryperiod" = Lieferzeitraum (requires shippingEndDate)'),
+				.describe(SHIPPING_TYPE_HINT),
 		})
 		.describe('Required by Lexoffice API'),
 	introduction: z
@@ -1948,14 +1966,14 @@ const dunningSchema = {
 		.object({
 			shippingDate: z
 				.string()
-				.describe(`Service date for the dunning. Format: ${DATE_FORMAT_HINT}`),
+				.describe(`Service date for the dunning, usually the original invoice's service date. Format: ${DATE_FORMAT_HINT}`),
 			shippingEndDate: z
 				.string()
 				.optional()
-				.describe('Required only for period types (serviceperiod/deliveryperiod).'),
+				.describe('REQUIRED for period types (serviceperiod/deliveryperiod). OMIT for "service"/"delivery".'),
 			shippingType: z
 				.enum(['service', 'delivery', 'serviceperiod', 'deliveryperiod'])
-				.describe('"service" = Leistungsdatum (most common for dunnings)'),
+				.describe(SHIPPING_TYPE_HINT),
 		})
 		.describe('Required by Lexoffice API'),
 	introduction: z
