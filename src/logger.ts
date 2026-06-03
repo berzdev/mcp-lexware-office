@@ -17,7 +17,6 @@ export const logger = {
   error(message: string, data?: unknown) {
     const logMessage = formatMessage("ERROR", message, data);
     appendFileSync(LOG_FILE, logMessage);
-    // errors get also reported to the console (and thus to the mcp client via stdio)
     console.error(logMessage);
   },
 };
