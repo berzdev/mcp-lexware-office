@@ -797,7 +797,7 @@ server.tool(
 			...(companyName ? { company: { name: companyName, ...(taxNumber ? { taxNumber } : {}), ...(vatRegistrationId ? { vatRegistrationId } : {}) } } : {}),
 			...(lastName || firstName ? { person: { ...(salutation ? { salutation } : {}), ...(firstName ? { firstName } : {}), ...(lastName ? { lastName } : {}) } } : {}),
 			...(billingEntry ? { addresses: { billing: [billingEntry] } } : {}),
-			...(emailBusiness ? { emailAddresses: { business: { emailAddress: emailBusiness } } } : {}),
+			...(emailBusiness ? { emailAddresses: { business: [emailBusiness] } } : {}),
 			...(note ? { note } : {}),
 		});
 		if (!result || !result.ok) return { content: [{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) }] };
@@ -860,7 +860,7 @@ server.tool(
 			...(companyName ? { company: { name: companyName, ...(taxNumber ? { taxNumber } : {}), ...(vatRegistrationId ? { vatRegistrationId } : {}) } } : {}),
 			...(lastName || firstName ? { person: { ...(salutation ? { salutation } : {}), ...(firstName ? { firstName } : {}), ...(lastName ? { lastName } : {}) } } : {}),
 			...(billingEntry ? { addresses: { billing: [billingEntry] } } : {}),
-			...(emailBusiness ? { emailAddresses: { business: { emailAddress: emailBusiness } } } : {}),
+			...(emailBusiness ? { emailAddresses: { business: [emailBusiness] } } : {}),
 			...(note ? { note } : {}),
 		});
 		if (!result || !result.ok) return { content: [{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) }] };
