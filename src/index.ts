@@ -226,7 +226,7 @@ const articlePriceSchema = z.object({
 const gtinSchema = z
 	.string()
 	.regex(/^(?:\d{8}|\d{12}|\d{13}|\d{14})$/)
-	.describe('GTIN/EAN/UPC barcode. Lexware accepts GTIN-8, GTIN-12 (UPC), GTIN-13 (EAN), or GTIN-14.');
+	.describe('Use this field for EAN/UPC barcodes. Lexware calls the field "gtin" and accepts GTIN-8, GTIN-12 (UPC), GTIN-13 (EAN), or GTIN-14.');
 
 // Fix #2: strip server-managed read-only fields before PUT
 function stripReadOnlyFields(obj: Record<string, unknown>): Record<string, unknown> {
@@ -507,11 +507,11 @@ server.tool(
 
 server.tool(
 	'get-articles',
-	'Get a list of articles (Artikel/Produkte) from Lexware Office with optional filters.',
+	'Get a list of articles (Artikel/Produkte) from Lexware Office with optional filters, including gtin for EAN/UPC barcodes.',
 	{
 		articleNumber: z.string().optional().describe('Filter by article number'),
 		name: z.string().optional().describe('Filter by article name (substring)'),
-		gtin: gtinSchema.optional().describe('Filter by GTIN/EAN/UPC barcode'),
+		gtin: gtinSchema.optional().describe('Filter by EAN/UPC barcode using Lexware\'s "gtin" query parameter'),
 		type: z.enum(['PRODUCT', 'SERVICE']).optional().describe('Filter by article type'),
 		archived: z
 			.enum(['active', 'archived', 'all'])
@@ -834,13 +834,13 @@ server.tool(
 
 server.tool(
 	'create-article',
-	'Create a new article (Artikel/Produkt) in Lexware Office.',
+	'Create a new article (Artikel/Produkt) in Lexware Office. To set EAN or UPC, use the gtin field.',
 	{
 		type: z.enum(['PRODUCT', 'SERVICE']).describe('PRODUCT (Ware) or SERVICE (Dienstleistung)'),
 		title: z.string().describe('Article name/title'),
 		description: z.string().optional().describe('Article description'),
 		articleNumber: z.string().optional().describe('Article number (Artikelnummer)'),
-		gtin: gtinSchema.optional(),
+		gtin: gtinSchema.optional().describe('EAN/UPC barcode stored in Lexware as gtin. Use GTIN-13 for EAN and GTIN-12 for UPC.'),
 		unitName: z.string().optional().describe('Unit name, e.g. "Stunden", "Stück"'),
 		price: articlePriceSchema.optional().describe('Selling price'),
 	},
@@ -860,7 +860,7 @@ server.tool(
 
 server.tool(
 	'update-article',
-	'Update an existing article in Lexware Office. Requires the current version number for optimistic locking (get it from get-article-details).',
+	'Update an existing article in Lexware Office. Requires the current version number for optimistic locking (get it from get-article-details). To set or change EAN/UPC, use the gtin field.',
 	{
 		id: z.string().uuid().describe('The ID of the article to update'),
 		version: z.number().int().describe('Current version (for optimistic locking)'),
@@ -868,7 +868,7 @@ server.tool(
 		title: z.string().describe('Article name/title'),
 		description: z.string().optional(),
 		articleNumber: z.string().optional(),
-		gtin: gtinSchema.optional(),
+		gtin: gtinSchema.optional().describe('EAN/UPC barcode stored in Lexware as gtin. Use GTIN-13 for EAN and GTIN-12 for UPC.'),
 		unitName: z.string().optional(),
 		price: articlePriceSchema.optional(),
 	},
