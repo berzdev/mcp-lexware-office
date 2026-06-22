@@ -223,6 +223,11 @@ const articlePriceSchema = z.object({
 	taxRate: z.number().describe('Tax rate percentage, e.g. 19 for 19%, 7 for 7%, 0 for tax-free'),
 });
 
+const gtinSchema = z
+	.string()
+	.regex(/^(?:\d{8}|\d{12}|\d{13}|\d{14})$/)
+	.describe('GTIN/EAN/UPC barcode. Lexware accepts GTIN-8, GTIN-12 (UPC), GTIN-13 (EAN), or GTIN-14.');
+
 // Fix #2: strip server-managed read-only fields before PUT
 function stripReadOnlyFields(obj: Record<string, unknown>): Record<string, unknown> {
 	const { id, resourceUri, createdDate, updatedDate, ...rest } = obj;
@@ -506,6 +511,7 @@ server.tool(
 	{
 		articleNumber: z.string().optional().describe('Filter by article number'),
 		name: z.string().optional().describe('Filter by article name (substring)'),
+		gtin: gtinSchema.optional().describe('Filter by GTIN/EAN/UPC barcode'),
 		type: z.enum(['PRODUCT', 'SERVICE']).optional().describe('Filter by article type'),
 		archived: z
 			.enum(['active', 'archived', 'all'])
@@ -515,10 +521,11 @@ server.tool(
 		page: z.number().min(0).optional().default(0).describe('page number; starts at 0'),
 		size: z.number().min(1).max(250).optional().default(250).describe('results per page'),
 	},
-	async ({ articleNumber, name, type, archived, page, size }) => {
+	async ({ articleNumber, name, gtin, type, archived, page, size }) => {
 		const params = new URLSearchParams({ page: String(page), size: String(size) });
 		if (articleNumber) params.append('articleNumber', articleNumber);
 		if (name) params.append('name', name);
+		if (gtin) params.append('gtin', gtin);
 		if (type) params.append('type', type);
 		if (archived === 'active') params.append('archived', 'false');
 		else if (archived === 'archived') params.append('archived', 'true');
@@ -833,13 +840,15 @@ server.tool(
 		title: z.string().describe('Article name/title'),
 		description: z.string().optional().describe('Article description'),
 		articleNumber: z.string().optional().describe('Article number (Artikelnummer)'),
+		gtin: gtinSchema.optional(),
 		unitName: z.string().optional().describe('Unit name, e.g. "Stunden", "Stück"'),
 		price: articlePriceSchema.optional().describe('Selling price'),
 	},
-	async ({ type, title, description, articleNumber, unitName, price }) => {
+	async ({ type, title, description, articleNumber, gtin, unitName, price }) => {
 		const body: Record<string, unknown> = { type, title };
 		if (description) body.description = description;
 		if (articleNumber) body.articleNumber = articleNumber;
+		if (gtin) body.gtin = gtin;
 		if (unitName) body.unitName = unitName;
 		if (price) body.price = price;
 		const result = await makeLexwareOfficeWriteRequest<any>('/v1/articles', 'POST', body);
@@ -859,13 +868,15 @@ server.tool(
 		title: z.string().describe('Article name/title'),
 		description: z.string().optional(),
 		articleNumber: z.string().optional(),
+		gtin: gtinSchema.optional(),
 		unitName: z.string().optional(),
 		price: articlePriceSchema.optional(),
 	},
-	async ({ id, version, type, title, description, articleNumber, unitName, price }) => {
+	async ({ id, version, type, title, description, articleNumber, gtin, unitName, price }) => {
 		const body: Record<string, unknown> = { version, type, title };
 		if (description) body.description = description;
 		if (articleNumber) body.articleNumber = articleNumber;
+		if (gtin) body.gtin = gtin;
 		if (unitName) body.unitName = unitName;
 		if (price) body.price = price;
 		const result = await makeLexwareOfficeWriteRequest<any>(`/v1/articles/${id}`, 'PUT', body);
